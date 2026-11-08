@@ -33,6 +33,16 @@
 # NETWORK STABILITY:
 # - Polling: 15s | Timeout: 30s | No forced updates (Anti-DDoS).
 #
+# CHANGES (search for "FIX"):
+# FIX 1: soc_off falls back to 20 if the helper is unavailable (was: 0 -> the
+#        cutoff never triggered).
+# FIX 2: The SoC cutoff (battery empty) now ranks BEFORE the Shelly failsafe.
+#        Before, a Shelly outage forced failsafe_watt at any state of charge.
+# FIX 3: Below the cutoff, the 0 W command is written even if the last sent
+#        value was within the hysteresis band (e.g. 3 W stayed at 3 W forever).
+# FIX 4: Drift self-correction only runs while the device is reachable.
+# FIX 5: Emergency-charge stop level is clamped to at least start+1 (no flapping).
+#
 ################################################################################
 
 # ==============================================================================
@@ -40,10 +50,8 @@
 # ==============================================================================
 
 # ── DEVICE IP (CENTRAL CONFIGURATION) ────────────────────────────────────────
-# Set this from the HA UI: Settings → Devices → Helpers → "Zendure: Device
-# IP Address". There is intentionally no `initial:` — the helper restores its
-# last value across restarts, so a value entered in the UI persists. Re-adding
-# `initial:` would force that literal on every restart and wipe UI edits.
+# Change this to your SolarFlow's local IP address.
+# Editable from the HA UI: Settings → Devices → Helpers
 input_text:
   zendure_device_ip:
     name: "Zendure: Device IP Address"
@@ -60,13 +68,10 @@ input_boolean:
   # Device-1 participation flag for the multi-device coordinator. Solo mode
   # ignores this entirely — leave it on. In coordinator mode, flipping it off
   # removes device 1 from the active set (useful during maintenance).
-  # No `initial:` so a maintenance toggle survives a restart. Trade-off: a
-  # fresh install with no stored state defaults to OFF (HA input_boolean
-  # default = off), i.e. device 1 sits out until switched on. Re-add
-  # `initial: true` if you prefer participate-by-default on first boot.
   zendure_enabled:
     name: "Zendure: Device 1 Enabled"
     icon: mdi:power
+    initial: true
 
   zendure_emergency_charge:
     name: "Status: Emergency Charging"
@@ -112,9 +117,9 @@ input_number:
   zendure_conf_max_output:
     name: "Zendure: Max Output"
     min: 0
-    max: 800
+    max: 600
     step: 10
-    initial: 800
+    initial: 600
     unit_of_measurement: "W"
     mode: box
 
@@ -134,7 +139,7 @@ input_number:
     name: "Zendure: Min Output at 100% (Winter)"
     icon: mdi:water-percent
     min: 0
-    max: 800
+    max: 600
     step: 10
     initial: 250
     unit_of_measurement: "W"
@@ -144,7 +149,7 @@ input_number:
     name: "Zendure: Min Output at 100% (Summer)"
     icon: mdi:water-percent
     min: 0
-    max: 800
+    max: 600
     step: 10
     initial: 250
     unit_of_measurement: "W"
@@ -434,7 +439,9 @@ rest_command:
     payload: >
       {
         "properties": {
+          "acMode": 2,
           "outputLimit": {{ limit | int }},
+          "inputLimit": 0,
           "chargeMaxLimit": 0
         },
         "sn": "{{ state_attr('sensor.solarflow_status_raw', 'sn') }}"
@@ -449,7 +456,9 @@ rest_command:
     payload: >
       {
         "properties": {
+          "acMode": 1,
           "outputLimit": 0,
+          "inputLimit": {{ limit | int }},
           "chargeMaxLimit": {{ limit | int }}
         },
         "sn": "{{ state_attr('sensor.solarflow_status_raw', 'sn') }}"
@@ -476,7 +485,9 @@ rest_command:
     payload: >
       {
         "properties": {
+          "acMode": 2,
           "outputLimit": {{ limit | int }},
+          "inputLimit": 0,
           "chargeMaxLimit": 0
         },
         "sn": "{{ sn }}"
@@ -490,7 +501,9 @@ rest_command:
     payload: >
       {
         "properties": {
+          "acMode": 1,
           "outputLimit": 0,
+          "inputLimit": {{ limit | int }},
           "chargeMaxLimit": {{ limit | int }}
         },
         "sn": "{{ sn }}"
@@ -593,7 +606,9 @@ automation:
           hysteresis_watt: "{{ states('input_number.zendure_conf_hysteresis') | int }}"
           grid_bias: "{{ states('input_number.zendure_conf_grid_bias_' ~ season) | int }}"
 
-          soc_off: "{{ states('input_number.zendure_conf_soc_off_' ~ season) | int }}"
+          # FIX 1: fallback 20 instead of 0. With 'unavailable' the old `| int`
+          # returned 0, so "battery <= soc_off" was never true.
+          soc_off: "{{ states('input_number.zendure_conf_soc_off_' ~ season) | int(20) }}"
           soc_bypass: "{{ states('input_number.zendure_conf_soc_bypass') | int }}"
           
           # --- SENSORS & MEMORY ---
@@ -610,7 +625,7 @@ automation:
           # reset (e.g. outputLimit → 0) within the gap leaves the loop
           # stuck: allocation matches last_sent within hysteresis, no
           # corrective write ever fires.
-          is_drifting: "{{ raw_last_sent >= 0 and (raw_last_sent - current_limit)|abs >= hysteresis_watt }}"
+          is_drifting: "{{ raw_last_sent >= 0 and (raw_last_sent - current_limit)|abs > hysteresis_watt }}"
           
           # Safe base
           base_value: >
@@ -638,11 +653,10 @@ automation:
 
 
       # --- SELF-HEALING MEMORY ---
-      # Gated on zendure_ok and sn_ok: if the REST sensor is briefly
-      # 'unavailable', `current_limit` defaults to 0 (line above), which
-      # would falsely fire is_drifting and stamp last_sent to 0. The
-      # coordinator gates the same correction at zendure_coordinator.yaml
-      # Phase 2 via `if d.ok and is_drifting`.
+      # FIX 4: gated on zendure_ok and sn_ok. If the REST sensor is briefly
+      # 'unavailable', `current_limit` defaults to 0, which would falsely fire
+      # is_drifting and stamp last_sent to 0. (The coordinator gates the same
+      # correction in Phase 2 via `d.ok and is_drifting`.)
       - choose:
           - conditions: "{{ is_drifting and zendure_ok and sn_ok }}"
             sequence:
@@ -656,20 +670,21 @@ automation:
       # --- CALCULATION BLOCK ---
       - variables:
           calc_target: >
-            {# PRIO 1: FAILSAFE (Strict SN Check) #}
-            {% if not shelly_ok and zendure_ok and sn_ok %}
-              {{ failsafe_watt }}
-
-            {# PRIO 2: API/SN ERROR #}
-            {% elif not (zendure_ok and sn_ok) %}
+            {# PRIO 1: API/SN ERROR -> nothing is written (-1 = abort) #}
+            {% if not (zendure_ok and sn_ok) %}
               -1
 
-            {# PRIO 3: WINTER PROTECTION #}
-            {% elif temp_device < 0 and pv_power < 100 %}
+            {# PRIO 2: BATTERY EMPTY (FIX 2: before the failsafe, so a Shelly
+               outage can no longer force a discharge below the SoC cutoff) #}
+            {% elif battery <= soc_off %}
               0
 
-            {# PRIO 4: BATTERY EMPTY #}
-            {% elif battery <= soc_off %}
+            {# PRIO 3: FAILSAFE (Shelly offline, battery above cutoff) #}
+            {% elif not shelly_ok %}
+              {{ failsafe_watt }}
+
+            {# PRIO 4: WINTER PROTECTION #}
+            {% elif temp_device < 0 and pv_power < 100 %}
               0
 
             {# PRIO 5: BYPASS (CONSERVATION MODE) #}
@@ -707,6 +722,21 @@ automation:
           - conditions: "{{ calc_target | int == -1 }}"
             sequence: []
           
+          # FIX 3: Case: Shutdown below the SoC cutoff. Ignores the hysteresis:
+          # as long as the device still outputs power, 0 W is written.
+          - conditions:
+              - condition: template
+                value_template: "{{ zendure_ok and sn_ok and battery <= soc_off and calc_target | int == 0 and current_limit | int > 0 }}"
+            sequence:
+              - service: rest_command.zendure_set_output
+                data:
+                  limit: 0
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.zendure_last_sent_limit
+                data:
+                  value: 0
+
           # Case: Fast Export Clamp
           - conditions: 
               - condition: template
@@ -781,19 +811,16 @@ automation:
       # input_number helpers from this block.
 
       # Check Emergency Charge
-      # `effective_stop` enforces stop > start at runtime — the helper
-      # bounds permit stop ≤ start (legal per UI), which would oscillate
-      # the boolean on every Logic Manager tick (start fires when
-      # bat<start, stop fires when bat>stop, and any band where both
-      # conditions hold causes flapping). Clamp stop to at least start+1.
       - variables:
           bat: "{{ states('sensor.solarflow_battery_level')|float(0) }}"
           start_lim: "{{ states('input_number.zendure_conf_soc_emerg_start')|int }}"
+          # FIX 5: stop must be at least start+1, otherwise the emergency charge
+          # flaps on and off on every Logic Manager tick (helper bounds allow stop <= start).
           stop_raw: "{{ states('input_number.zendure_conf_soc_emerg_stop')|int }}"
           stop_lim: "{{ [stop_raw, start_lim + 1] | max }}"
-          forecast: "{{ states('sensor.energy_production_tomorrow')|float(0) }}"
+          forecast: "{{ states('sensor.energy_production_tomorrow_2')|float(0) }}"
           thresh: "{{ states('input_number.zendure_conf_forecast_thresh')|float }}"
-
+      
       - choose:
           - conditions:
               - condition: template
@@ -807,7 +834,7 @@ automation:
               - service: input_boolean.turn_on
                 target:
                   entity_id: input_boolean.zendure_emergency_charge
-
+          
           - conditions:
               - condition: template
                 value_template: "{{ bat > stop_lim }}"
@@ -819,13 +846,69 @@ automation:
                 target:
                   entity_id: input_boolean.zendure_emergency_charge
 
-      # Check Calibration
+      # Check Calibration / Original
+    #   - variables:
+    #       days_threshold: "{{ states('input_number.zendure_conf_calib_days') | int }}"
+    #       last_run: "{{ states('input_datetime.zendure_last_full_charge') }}"
+    #       # Read socSet so the calibration end condition tracks the user's
+    #       # configured max-charge — hardcoded 100% would never release when
+    #       # socSet < 100, leaving the device stuck in force-charge.
+    #       socset: >-
+    #         {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
+    #         {{ (p.get('socSet', 1000) | float / 10) if p is mapping else 100 }}
+    #       days_diff: >
+    #         {% if last_run not in ['unknown', 'unavailable'] %}
+    #           {{ (as_timestamp(now()) - as_timestamp(last_run)) / 86400 }}
+    #         {% else %} 999 {% endif %}
+
+    #   - choose:
+    #       - conditions:
+    #           - condition: template
+    #             value_template: "{{ days_diff | float >= days_threshold }}"
+    #           - condition: state
+    #             entity_id: input_boolean.zendure_calibration_mode
+    #             state: "off"
+    #         sequence:
+    #           - service: input_boolean.turn_on
+    #             target:
+    #               entity_id: input_boolean.zendure_calibration_mode
+    #           - service: persistent_notification.create
+    #             data:
+    #               title: "Zendure Cell Maintenance"
+    #               message: "Starting calibration ({{ days_diff | int }} days without full charge)."
+
+    #       - conditions:
+    #           - condition: template
+    #             value_template: "{{ bat >= socset - 1 }}"
+    #           - condition: state
+    #             entity_id: input_boolean.zendure_calibration_mode
+    #             state: "on"
+    #         sequence:
+    #           - service: input_boolean.turn_off
+    #             target:
+    #               entity_id: input_boolean.zendure_calibration_mode
+    #           - service: persistent_notification.create
+    #             data:
+    #               title: "Zendure Calibration"
+    #               message: "Complete (target SoC {{ socset | int }}% reached)."
+
+      # Check Calibration (start only during the low-tariff window; once started it runs until the battery is full).
+      # Calibration only starts after 20:00, i.e. inside the low-tariff window.
+      # Charge speed: if time could get tight, increase zendure_conf_emergency_watt (“AC Charge Speed”).
+      # This also applies to emergency charging.
       - variables:
           days_threshold: "{{ states('input_number.zendure_conf_calib_days') | int }}"
           last_run: "{{ states('input_datetime.zendure_last_full_charge') }}"
-          # Read socSet so the calibration end condition tracks the user's
-          # configured max-charge — hardcoded 100% would never release when
-          # socSet < 100, leaving the device stuck in force-charge.
+          # Low-tariff window, only relevant for the START (full hours, 24h):
+          win_start: 20
+          win_end: 7
+          in_window: >-
+            {% set h = now().hour %}
+            {% if win_start > win_end %}
+              {{ h >= win_start or h < win_end }}
+            {% else %}
+              {{ win_start <= h < win_end }}
+            {% endif %}
           socset: >-
             {% set p = state_attr('sensor.solarflow_status_raw','properties') %}
             {{ (p.get('socSet', 1000) | float / 10) if p is mapping else 100 }}
@@ -835,9 +918,12 @@ automation:
             {% else %} 999 {% endif %}
 
       - choose:
+          # START: only inside the low-tariff window
           - conditions:
               - condition: template
                 value_template: "{{ days_diff | float >= days_threshold }}"
+              - condition: template
+                value_template: "{{ in_window | trim == 'True' }}"
               - condition: state
                 entity_id: input_boolean.zendure_calibration_mode
                 state: "off"
@@ -850,6 +936,7 @@ automation:
                   title: "Zendure Cell Maintenance"
                   message: "Starting calibration ({{ days_diff | int }} days without full charge)."
 
+          # ENDE: Ziel-SoC erreicht, jederzeit
           - conditions:
               - condition: template
                 value_template: "{{ bat >= socset - 1 }}"
@@ -864,8 +951,7 @@ automation:
                 data:
                   title: "Zendure Calibration"
                   message: "Complete (target SoC {{ socset | int }}% reached)."
-
-
+                  
 # ==============================================================================
 # 8. FLASH PROTECTION (smartMode)
 # ==============================================================================

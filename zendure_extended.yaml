@@ -683,7 +683,7 @@ template:
 
       # ════════════════════════════════════════════════════════════════════
       # BATTERY PACK 1 SENSORS (packData[0])
-      # SN: CO4EHNCDN331097
+      # SN: COXXXXXXXXXXXXX
       # ════════════════════════════════════════════════════════════════════
       # Requires "packData" in json_attributes of the REST sensor.
 
@@ -766,7 +766,9 @@ template:
           {% if pd is iterable and pd | length > 0 and pd[0] is mapping %}
             {% set val = pd[0].get('batcur', none) %}
             {% if val is not none %}
-              {{ (val | float / 10) | round(1) }}
+              {# raw 16-bit two's complement: 65535 = -0.1 A, not 6553.5 A #}
+              {% set raw = val | int %}
+              {{ ((raw - 65536 if raw > 32767 else raw) / 10) | round(1) }}
             {% else %}unavailable{% endif %}
           {% else %}unavailable{% endif %}
 
@@ -842,7 +844,7 @@ template:
 
       # ════════════════════════════════════════════════════════════════════
       # BATTERY PACK 2 SENSORS (packData[1])
-      # SN: CO4ESNFRN360036
+      # SN: COYYYYYYYYYYYYY
       # ════════════════════════════════════════════════════════════════════
 
       - name: "SolarFlow Pack 2 SoC"
@@ -918,7 +920,9 @@ template:
           {% if pd is iterable and pd | length > 1 and pd[1] is mapping %}
             {% set val = pd[1].get('batcur', none) %}
             {% if val is not none %}
-              {{ (val | float / 10) | round(1) }}
+              {# raw 16-bit two's complement: 65535 = -0.1 A, not 6553.5 A #}
+              {% set raw = val | int %}
+              {{ ((raw - 65536 if raw > 32767 else raw) / 10) | round(1) }}
             {% else %}unavailable{% endif %}
           {% else %}unavailable{% endif %}
 

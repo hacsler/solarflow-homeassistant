@@ -19,6 +19,24 @@
 # - The seasonal switch (SoC cutoff / grid bias / saturation) lives in
 #   device 1's Logic Manager and is applied globally; we don't duplicate it.
 #
+# CHARGE-FIRST (FIX 7):
+# Device 2 charges from PV first and only discharges once its SoC reached
+# input_number.zendure_2_conf_discharge_release_soc (set it once in the UI, e.g.
+# 80; 0 = off). It locks again below (release - hysteresis). More full charges,
+# fewer calibration runs. The allocation itself is done in the coordinator.
+#
+# SCALING (FIX 6):
+# Device 2 has one panel and half the capacity of device 1. Two helpers below
+# scale the shared device-1 settings for it:
+#   zendure_2_conf_capacity_factor  -> AC charge speed (emergency/calibration)
+#                                      and, in the coordinator, failsafe base load
+#   zendure_2_conf_pv_factor        -> forecast threshold for the emergency
+#                                      charge and, in the coordinator, the
+#                                      saturation floor
+# Defaults: capacity 0.5 (half the capacity), PV 0.25 (one 385 Wp panel vs. four
+# ~400 Wp panels = 385/1600 = 0.24). Change them in the helper definitions (the
+# `initial:` value is applied on every restart).
+#
 # SETUP:
 # 1. Copy this file into packages/
 # 2. Set input_text.zendure_device_2_ip (below or via HA UI).
@@ -49,6 +67,13 @@ input_boolean:
     name: "Zendure 2: Device Enabled"
     icon: mdi:power
 
+  # FIX 7: latch for the charge-first mode (on = discharge released).
+  # Switched by the automation "Zendure 2: Charge-First Release". No `initial:`
+  # so the state survives a restart.
+  zendure_2_discharge_released:
+    name: "Zendure 2: Discharge Released"
+    icon: mdi:battery-arrow-down
+
   zendure_2_emergency_charge:
     name: "Zendure 2: Emergency Charging"
     icon: mdi:battery-alert
@@ -71,6 +96,46 @@ input_number:
     min: -2
     max: 1200
     step: 1
+    mode: box
+
+  # FIX 6: scaling vs. device 1 (device 2: one panel, half the capacity)
+  zendure_2_conf_capacity_factor:
+    name: "Zendure 2: Capacity Factor (vs. Device 1)"
+    icon: mdi:battery-half
+    min: 0.1
+    max: 2
+    step: 0.05
+    initial: 0.5
+    mode: box
+
+  # FIX 7: charge-first. Intentionally NO `initial:` so the value you set in the
+  # UI survives restarts. Until you set it, the value is 0 = feature off.
+  zendure_2_conf_discharge_release_soc:
+    name: "Zendure 2: Release Discharge from SoC (0 = off)"
+    icon: mdi:battery-charging-80
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+
+  zendure_2_conf_discharge_hysteresis:
+    name: "Zendure 2: Re-Lock Hysteresis"
+    icon: mdi:arrow-expand-vertical
+    min: 1
+    max: 30
+    step: 1
+    initial: 5
+    unit_of_measurement: "%"
+    mode: box
+
+  zendure_2_conf_pv_factor:
+    name: "Zendure 2: PV Factor (vs. Device 1)"
+    icon: mdi:solar-panel
+    min: 0.05
+    max: 2
+    step: 0.05
+    initial: 0.25
     mode: box
 
 
@@ -235,7 +300,8 @@ automation:
                 data:
                   ip: "{{ states('input_text.zendure_device_2_ip') }}"
                   sn: "{{ state_attr('sensor.solarflow_2_status_raw', 'sn') }}"
-                  limit: "{{ states('input_number.zendure_conf_emergency_watt')|int }}"
+                  # FIX 6: scaled by the capacity factor
+                  limit: "{{ (states('input_number.zendure_conf_emergency_watt') | float(0) * states('input_number.zendure_2_conf_capacity_factor') | float(0.5)) | int }}"
               - service: input_number.set_value
                 target:
                   entity_id: input_number.zendure_2_last_sent_limit
@@ -299,7 +365,8 @@ automation:
           stop_raw: "{{ states('input_number.zendure_conf_soc_emerg_stop')|int }}"
           stop_lim: "{{ [stop_raw, start_lim + 1] | max }}"
           forecast: "{{ states('sensor.energy_production_tomorrow')|float(0) }}"
-          thresh: "{{ states('input_number.zendure_conf_forecast_thresh')|float }}"
+          # FIX 6: forecast threshold scaled by the PV factor (own, smaller array)
+          thresh: "{{ states('input_number.zendure_conf_forecast_thresh') | float * states('input_number.zendure_2_conf_pv_factor') | float(0.25) }}"
       - choose:
           - conditions:
               - condition: template
@@ -324,10 +391,62 @@ automation:
                 target:
                   entity_id: input_boolean.zendure_2_emergency_charge
 
-      # Calibration check
+    #   # Calibration check
+    #   - variables:
+    #       days_threshold: "{{ states('input_number.zendure_conf_calib_days') | int }}"
+    #       last_run: "{{ states('input_datetime.zendure_2_last_full_charge') }}"
+    #       socset: >-
+    #         {% set p = state_attr('sensor.solarflow_2_status_raw','properties') %}
+    #         {{ (p.get('socSet', 1000) | float / 10) if p is mapping else 100 }}
+    #       days_diff: >
+    #         {% if last_run not in ['unknown', 'unavailable'] %}
+    #           {{ (as_timestamp(now()) - as_timestamp(last_run)) / 86400 }}
+    #         {% else %} 999 {% endif %}
+    #   - choose:
+    #       - conditions:
+    #           - condition: template
+    #             value_template: "{{ days_diff | float >= days_threshold }}"
+    #           - condition: state
+    #             entity_id: input_boolean.zendure_2_calibration_mode
+    #             state: "off"
+    #         sequence:
+    #           - service: input_boolean.turn_on
+    #             target:
+    #               entity_id: input_boolean.zendure_2_calibration_mode
+    #           - service: persistent_notification.create
+    #             data:
+    #               title: "Zendure 2 Cell Maintenance"
+    #               message: "Starting calibration ({{ days_diff | int }} days without full charge)."
+    #       - conditions:
+    #           - condition: template
+    #             value_template: "{{ bat >= socset - 1 }}"
+    #           - condition: state
+    #             entity_id: input_boolean.zendure_2_calibration_mode
+    #             state: "on"
+    #         sequence:
+    #           - service: input_boolean.turn_off
+    #             target:
+    #               entity_id: input_boolean.zendure_2_calibration_mode
+    #           - service: persistent_notification.create
+    #             data:
+    #               title: "Zendure 2 Calibration"
+    #               message: "Complete (target SoC {{ socset | int }}% reached)."
+      # Calibration check (start only during the low-tariff window; once started it runs until the battery is full). Calibration starts after 21:00.
+      # 
       - variables:
           days_threshold: "{{ states('input_number.zendure_conf_calib_days') | int }}"
           last_run: "{{ states('input_datetime.zendure_2_last_full_charge') }}"
+          # Low-tariff window, only relevant for the START (full hours, 24h).
+          # Keep identical to device 1.
+          win_start: 21
+          win_end: 6
+          in_window: >-
+            {% set h = now().hour %}
+            {% if win_start > win_end %}
+              {{ h >= win_start or h < win_end }}
+            {% else %}
+              {{ win_start <= h < win_end }}
+            {% endif %}
           socset: >-
             {% set p = state_attr('sensor.solarflow_2_status_raw','properties') %}
             {{ (p.get('socSet', 1000) | float / 10) if p is mapping else 100 }}
@@ -336,9 +455,12 @@ automation:
               {{ (as_timestamp(now()) - as_timestamp(last_run)) / 86400 }}
             {% else %} 999 {% endif %}
       - choose:
+          # START: only inside the low-tariff window
           - conditions:
               - condition: template
                 value_template: "{{ days_diff | float >= days_threshold }}"
+              - condition: template
+                value_template: "{{ in_window | trim == 'True' }}"
               - condition: state
                 entity_id: input_boolean.zendure_2_calibration_mode
                 state: "off"
@@ -350,6 +472,7 @@ automation:
                 data:
                   title: "Zendure 2 Cell Maintenance"
                   message: "Starting calibration ({{ days_diff | int }} days without full charge)."
+          # ENDE: Ziel-SoC erreicht, jederzeit
           - conditions:
               - condition: template
                 value_template: "{{ bat >= socset - 1 }}"
@@ -364,7 +487,6 @@ automation:
                 data:
                   title: "Zendure 2 Calibration"
                   message: "Complete (target SoC {{ socset | int }}% reached)."
-
 
 # ==============================================================================
 # 7. FLASH PROTECTION (DEVICE 2)
@@ -429,3 +551,47 @@ automation:
       - service: persistent_notification.dismiss
         data:
           notification_id: "zendure_2_device_offline"
+
+
+# ==============================================================================
+# 10. CHARGE-FIRST RELEASE (FIX 7)
+# ==============================================================================
+# Switches the latch input_boolean.zendure_2_discharge_released:
+#   ON  when SoC >= release level (device 2 may discharge)
+#   OFF when SoC <  release level - hysteresis (device 2 charges first again)
+# The coordinator reads the latch and caps device 2 at 0 W while it is off.
+  - alias: "Zendure 2: Charge-First Release"
+    id: "zendure_2_charge_first_release"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id:
+          - sensor.solarflow_2_battery_level
+          - input_number.zendure_2_conf_discharge_release_soc
+          - input_number.zendure_2_conf_discharge_hysteresis
+      - platform: time_pattern
+        minutes: "/5"
+      - platform: homeassistant
+        event: start
+    condition:
+      - condition: template
+        value_template: >-
+          {{ states('sensor.solarflow_2_battery_level') | is_number
+             and states('input_number.zendure_2_conf_discharge_release_soc') | is_number }}
+    action:
+      - variables:
+          bat: "{{ states('sensor.solarflow_2_battery_level') | float(0) }}"
+          release: "{{ states('input_number.zendure_2_conf_discharge_release_soc') | float(0) }}"
+          hyst: "{{ states('input_number.zendure_2_conf_discharge_hysteresis') | float(5) }}"
+          released: "{{ is_state('input_boolean.zendure_2_discharge_released', 'on') }}"
+      - choose:
+          - conditions: "{{ not released and bat >= release }}"
+            sequence:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.zendure_2_discharge_released
+          - conditions: "{{ released and release > 0 and bat < release - hyst }}"
+            sequence:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.zendure_2_discharge_released

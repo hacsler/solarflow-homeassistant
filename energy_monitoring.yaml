@@ -33,22 +33,21 @@
 input_text:
   # The device ID portion of your Shelly Pro 3EM entity IDs.
   # Example: if your entities are sensor.shellypro3em_d890ewfh_phase_a_active_power
-  #          then set this to "d890ewfh"
-  # Set it from the HA UI (Settings → Devices → Helpers). No `initial:` — the
-  # value restores across restarts and persists; re-adding it would wipe edits.
+  #          then set this to "<DEVICE_ID>"
   shelly_3em_device_id:
-    name: "Shelly 3EM: Device ID"
+    name: "Shelly  Pro 3EM: Device ID"
     icon: mdi:identifier
+#    initial: "<DEVICE_ID>"
     mode: text
 
   # Full entity ID of the solar generation power sensor.
-  # Set it from the HA UI, or set to "none" if you have no separate solar
-  # generation sensor. Example: "sensor.shellypmminig3_5432046f3b24_power".
-  # No `initial:` — restores across restarts. On a fresh install with no stored
-  # state it is empty, which the consumption template treats as "none".
+  # Leave at "none" if you don't have a separate solar generation sensor.
+  # Example: "sensor.shellypmminig3_<DEVICE_ID>_power"
   shelly_solar_entity:
     name: "Shelly Solar: Entity ID"
     icon: mdi:solar-power-variant
+#    initial: "sensor.shellypmminig3_<DEVICE_ID>_power"
+#    initial: "none"
     mode: text
 
 
@@ -60,6 +59,7 @@ template:
       # ── POWER IMPORT ───────────────────────────────────────────────────
       # Sum of all 3 phases, only counting positive values (grid → house).
       - name: "Power Import"
+        unique_id: power_import
         unit_of_measurement: "W"
         device_class: power
         state_class: measurement
@@ -83,6 +83,7 @@ template:
       # Sum of all 3 phases, only counting negative values (house → grid).
       # Reported as a positive number.
       - name: "Power Export"
+        unique_id: power_export
         unit_of_measurement: "W"
         device_class: power
         state_class: measurement
@@ -111,6 +112,7 @@ template:
       # as a NEGATIVE value. If your device reports it as positive,
       # remove the "* -1" on the solar_val line.
       - name: "Power Consumption"
+        unique_id: power_consumption
         unit_of_measurement: "W"
         device_class: power
         state_class: measurement
@@ -129,7 +131,7 @@ template:
             {{ import_val + solar_val }}
           {% elif delta > tolerance %}
             {{ delta }}
-          {% elif abs(delta) <= tolerance %}
+          {% elif (delta | abs) <= tolerance %}
             {{ 0 }}
           {% else %}
             {{ import_val + solar_val }}
