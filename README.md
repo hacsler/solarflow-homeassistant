@@ -1,10 +1,12 @@
 # Zendure SolarFlow 800 Pro — Local Control for Home Assistant
 
-Advanced local control for the Zendure SolarFlow 800 Pro, with extended monitoring of individual PV channels, per-battery pack diagnostics, and flash wear protection. No cloud, no MQTT, no HACS — just direct HTTP communication on your local network.
+Advanced local control for the Zendure SolarFlow 800 Pro, with extended monitoring of individual PV channels, per-battery pack diagnostics, flash wear protection, and a long-term monitoring package with a plain-text advisor. No cloud, no MQTT — just direct HTTP communication on your local network. (The optional advisor dashboard uses a custom card from HACS; the control package itself needs no HACS.)
 
 > **Based on the work by [zakazak / Utini2000](https://github.com/Utini2000/Zendure-Solarflow-Local-HomeAssistant)**
 > ([original forum post](https://community.home-assistant.io/t/zendure-solarflow-800-pro-completely-local-zereo-feed-in-without-cloud-and-even-faster-no-mqtt-no-hacs-easy-mode/980110)).
 > The core control logic — zero-export regulation, emergency charging, seasonal SoC management, calibration, and failsafe — is their design. This fork extends the sensor coverage, centralises the device IP, adds flash wear protection, aligns terminology with the [official zenSDK property reference](https://github.com/Zendure/zenSDK/blob/main/docs/en_properties.md), and translates all labels to English.
+>
+> **Fork of [arselzer/solarflow-homeassistant](https://github.com/arselzer/solarflow-homeassistant)** with additional work: a long-term **monitoring package** (`zendure_monitoring.yaml`) with a plain-text **advisor**, and a matching **advisor dashboard** (`dashboards/zendure_advisor_dashboard.yaml`). See [Monitoring and advisor](#monitoring-and-advisor-fork-addition).
 
 > [!IMPORTANT]
 > **This has only been tested with the Zendure SolarFlow 800 Pro** (product ID `solarFlow800Pro`, 2 × AB2000 battery packs). The zenSDK API is shared across the SolarFlow 800, 800 Pro, and 2400 AC, so the sensors *should* work on those models too — but property availability, value ranges, and unit scaling may differ. The `packInputPower` / `outputPackPower` swap applied in the net flow sensors was verified on the 800 Pro and may not apply to other models or firmware versions. If you're running a different device, start by inspecting your raw API output (`curl -s http://YOUR_IP/properties/report | python3 -m json.tool`) and compare it against the assumptions documented in the YAML comments before enabling the control loop.
@@ -36,6 +38,12 @@ The control loop runs every 5 seconds, reads the SolarFlow's state over HTTP, ca
 
 All sensor comments reference the official zenSDK property name, access mode, and unit for easy cross-referencing with the [Zendure documentation](https://github.com/Zendure/zenSDK/blob/main/docs/en_properties.md).
 
+### Monitoring and advisor (fork addition)
+
+- **Long-term battery and control statistics** — lowest state of charge, time below the cutoff, full and emergency charges, locked time (charge-first), discharge time, and control quality over 24 h / 7 days.
+- **Forecast vs. actual PV** — compares the Forecast.Solar prediction with the PV energy that actually arrived, per device, and suggests a corrected emergency-charge threshold.
+- **Plain-text advisor** — `sensor.zendure_advisor` turns the statistics into short warnings, checks, and notes (see below).
+
 ---
 
 ## Requirements
@@ -45,7 +53,8 @@ All sensor comments reference the official zenSDK property name, access mode, an
 | **Zendure SolarFlow 800 Pro** | Also compatible with Hyper 2000 and potentially Hub 2000 |
 | **Shelly Pro 3EM** | Grid power measurement (import/export) |
 | **Home Assistant** | Automation host |
-| **Forecast.Solar** integration | Optional — enables smart emergency charge decisions based on tomorrow's forecast |
+| **Forecast.Solar** integration | Optional — enables smart emergency charge decisions based on tomorrow's forecast, and the forecast-vs-actual part of the advisor |
+| **[apexcharts-card](https://github.com/RomRider/apexcharts-card)** (HACS) | Optional — only for the advisor dashboard |
 
 ---
 
@@ -56,6 +65,8 @@ All sensor comments reference the official zenSDK property name, access mode, an
 | `zendure.yaml` | Core package: helpers, REST sensor, template sensors, REST commands, control loop, state machine, logic manager, flash protection, monitoring |
 | `zendure_extended.yaml` | Drop-in addon: 56 extended sensors for per-panel power, per-pack diagnostics, status flags, config readback, and calculated metrics |
 | `energy_monitoring.yaml` | Shelly 3EM energy monitoring: 3-phase net import/export/consumption with daily & monthly utility meters. Configurable Shelly device ID. |
+| `zendure_monitoring.yaml` | *(fork addition)* Long-term monitoring: 24 h / 7 day battery and control statistics, forecast-vs-actual PV, and `sensor.zendure_advisor` |
+| `dashboards/zendure_advisor_dashboard.yaml` | *(fork addition)* Lovelace card stack for the advisor and the monitoring sensors (requires `apexcharts-card`) |
 | `zendure_device2.yaml` | *(optional, multi-device)* Second device: IP helper, enable flag, REST sensor, 6 core derived sensors, kWh integration, state machine, flash protection, per-device logic manager |
 | `zendure_device2_extended.yaml` | *(optional, multi-device)* 56 extended sensors for device 2 (per-panel PV, per-pack diagnostics, status flags, config readback) — mirror of `zendure_extended.yaml`. Regenerate via `tools/generate_device.py --n 2 --extended`. |
 | `zendure_coordinator.yaml` | *(optional, multi-device)* Coordinator control loop + strategy selector + diagnostic sensors. Replaces the solo loop when `zendure_coordinator_enabled` is on. |
@@ -84,6 +95,7 @@ config/
 └── packages/
     ├── zendure.yaml
     ├── zendure_extended.yaml
+    ├── zendure_monitoring.yaml   (optional, long-term monitoring and advisor)
     └── energy_monitoring.yaml    (optional, for Shelly 3EM)
 ```
 
@@ -132,6 +144,53 @@ logbook:
 ### 5. Restart Home Assistant
 
 After restart, the sensors will populate within 15 seconds (the polling interval). You'll see a persistent notification confirming flash protection is active if `smartMode` was previously set to 0.
+
+---
+
+## Monitoring and advisor (fork addition)
+
+`zendure_monitoring.yaml` is an optional package that watches how the control loop and the batteries behave over time and condenses this into plain-text hints. It only reads data; it never writes to the devices.
+
+### Installation
+
+1. Copy `zendure_monitoring.yaml` into `packages/` next to `zendure.yaml`.
+2. Make sure the sensors it reads exist: the core package, and for the forecast-vs-actual part the Forecast.Solar sensors. If you use two devices, install the multi-device files as well.
+3. Review the entity names at the top of the file (forecast sensors per device) and adjust them to your installation.
+4. Restart Home Assistant. Statistics need data: meaningful hints appear after about 2 to 3 days.
+
+### What it provides
+
+| Sensor | Meaning |
+|---|---|
+| `sensor.zendure_advisor` | Number of current hints. Attributes: `text` (all hints as plain text), `hints` (the same as a list), `updated` |
+| `sensor.zmon_dN_soc_min_24h` / `_7d` | Lowest state of charge of device N |
+| `sensor.zmon_dN_below_cutoff_7d` | Time spent below the discharge cutoff |
+| `sensor.zmon_dN_full_count_7d` / `_emergency_count_7d` | Number of full charges / emergency charges |
+| `sensor.zmon_dN_violation_24h` | Discharge below the cutoff within 24 h |
+| `sensor.zmon_d2_locked_7d` | Time device 2 was locked (charge-first) |
+| `sensor.zmon_discharging_7d` | Total discharge time |
+| `sensor.zmon_unused_reserve_7d` | Grid import although a usable battery was available |
+| `sensor.zmon_export_while_discharging_7d` / `_import_while_discharging_7d` | Control quality while discharging |
+| `sensor.zmon_shelly_offline_7d` | Time the Shelly meter was offline |
+| `sensor.zmon_pv_*` | Forecast vs. actual PV per device (live deviation, daily values, 7-day ratio and number of evaluated days) |
+
+### What the advisor reports
+
+Hints are prefixed by severity:
+
+- **WARNING** — a device discharged below the cutoff, a device or the Shelly was offline, or the coordinator has stopped ticking.
+- **CHECK** — a setting looks implausible, for example an emergency-charge stop value at or below the cutoff, a very large hysteresis, or swapped forecast sensors.
+- **NOTE** — observations from the last 7 days, such as time below the cutoff, no full charge, frequent emergency charges or calibrations, export or unnecessary import while discharging, and a forecast that is consistently too optimistic or too pessimistic (with a suggested threshold).
+- **INFO** — data collection is still running or too few days are available for the forecast comparison.
+- **OK** — no anomalies in the evaluated data.
+
+> **Breaking change in this fork:** the former German attribute `hinweise` is now named `hints`. Update any dashboard or automation that read the old attribute.
+
+### Advisor dashboard
+
+`dashboards/zendure_advisor_dashboard.yaml` is a `vertical-stack` card: the advisor text, battery and control statistics for both devices, forecast vs. actual PV, and two charts (PV per day, state of charge of both devices). The charts need the custom card **[apexcharts-card](https://github.com/RomRider/apexcharts-card)** (install it via HACS).
+
+To use it, open a dashboard, choose **Edit → Add card → Manual**, and paste the file's content. Adjust the entity IDs of the state-of-charge chart (`sensor.solarflow_battery_level`, `sensor.solarflow_2_battery_level`) if yours differ. For a single-device setup, remove the Device 2 entries.
 
 ---
 
@@ -505,6 +564,9 @@ Compared to [Utini2000/Zendure-Solarflow-Local-HomeAssistant](https://github.com
 | **Multi-device coordinator** *(opt-in)* | `zendure_coordinator.yaml` + `zendure_device2.yaml` add coordination for N ≥ 2 SolarFlow devices sharing one grid meter. Three allocation strategies (`priority_by_soc`, `priority_by_soc_bucketed`, `equal_split`) with water-fill redistribution, per-device enable flag, force-charge grid compensation, and the same drift/hysteresis/failsafe semantics as the solo loop. Solo users see zero behavior change. |
 | **Coordinator observability** *(opt-in)* | Diagnostic sensors (`sensor.zendure_coordinator_target` + per-device `…_coordinator_share`) fed by a `zendure_coordinator_tick` event each cycle. Fleet aggregate sensors summing across devices. Dry-run mode for pre-deployment validation. Heartbeat sensor and frozen-loop alert. Per-device offline notifications. |
 | **Device generator** *(opt-in)* | `tools/generate_device.py` clones `zendure_device2.yaml` into `zendure_deviceN.yaml` with correct prefixes + IP and prints the coordinator snippets to paste. With `--extended`, also clones `zendure_extended.yaml` into `zendure_deviceN_extended.yaml` for 56-sensor parity per device. Stdlib-only. |
+| **Monitoring package** *(opt-in, this fork)* | `zendure_monitoring.yaml` adds 24 h / 7 day battery and control statistics, forecast-vs-actual PV evaluation, and `sensor.zendure_advisor` with plain-text warnings, checks and notes. Read-only: it never writes to the devices. |
+| **Advisor dashboard** *(opt-in, this fork)* | `dashboards/zendure_advisor_dashboard.yaml` is a ready-made card stack for the advisor and the monitoring sensors. Requires `apexcharts-card`. |
+| **English advisor and labels** *(this fork)* | All comments, advisor messages and dashboard labels of the fork additions are in English. The advisor attribute `hinweise` is now `hints`. |
 
 ---
 
@@ -679,6 +741,27 @@ Fleet aggregates (state-based — update when underlying device sensors change):
 
 </details>
 
+<details>
+<summary><strong>Monitoring and advisor sensors</strong> (zendure_monitoring.yaml, fork addition)</summary>
+
+| Sensor | Notes |
+|---|---|
+| `sensor.zendure_advisor` | State: number of hints. Attributes: `text`, `hints`, `updated` |
+| `sensor.zmon_dN_soc_min_24h`, `_soc_min_7d` | Lowest state of charge of device N (%) |
+| `sensor.zmon_dN_below_cutoff_7d` | Time below the discharge cutoff |
+| `sensor.zmon_dN_full_count_7d`, `_emergency_count_7d` | Full charges / emergency charges in 7 days |
+| `sensor.zmon_dN_violation_24h` | Discharge below the cutoff within 24 h |
+| `sensor.zmon_d2_locked_7d` | Time device 2 was locked (charge-first) |
+| `sensor.zmon_discharging_7d` | Total discharge time |
+| `sensor.zmon_unused_reserve_7d` | Grid import despite a usable battery |
+| `sensor.zmon_export_while_discharging_7d`, `sensor.zmon_import_while_discharging_7d` | Control quality while discharging |
+| `sensor.zmon_shelly_offline_7d` | Shelly offline time |
+| `sensor.zmon_pv_deviation_N_live`, `sensor.zmon_pv_N_daily` | Live deviation of the PV forecast and PV energy today, per device |
+| `sensor.zmon_pv_ratio_N_avg7`, `sensor.zmon_pv_ratio_N_days` | Average actual / forecast ratio and number of evaluated days |
+| `sensor.zmon_pv_forecast_N_day`, `sensor.zmon_pv_actual_N_day` | Daily forecast and actual PV energy (kWh), used by the dashboard chart |
+
+</details>
+
 ---
 
 ## See also
@@ -690,8 +773,10 @@ Fleet aggregates (state-based — update when underlying device sensors change):
 ## Credits
 
 - **[zakazak / Utini2000](https://github.com/Utini2000/Zendure-Solarflow-Local-HomeAssistant)** — original control logic, zero-export strategy, and Home Assistant package architecture. Published under the [Home Assistant Community forum](https://community.home-assistant.io/t/zendure-solarflow-800-pro-completely-local-zereo-feed-in-without-cloud-and-even-faster-no-mqtt-no-hacs-easy-mode/980110).
+- **[arselzer](https://github.com/arselzer/solarflow-homeassistant)** — the fork this repository is based on: extended sensors, flash protection, multi-device coordinator and device generator.
 - **[Zendure / zenSDK](https://github.com/Zendure/zenSDK)** — official local API documentation, property reference, and openHAB examples used to verify sensor definitions and unit conversions.
 - **[epicRE / zendure_ble](https://github.com/epicRE/zendure_ble)** — Bluetooth protocol documentation with detailed property descriptions that helped identify `packData` fields and the input/output power semantics.
+- **This fork** — monitoring package (`zendure_monitoring.yaml`), advisor, advisor dashboard, and English translation of these additions.
 
 ---
 
