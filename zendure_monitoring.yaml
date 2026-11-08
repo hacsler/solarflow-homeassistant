@@ -1,0 +1,801 @@
+################################################################################
+#              ZENDURE MONITORING & ADVISOR PACKAGE (READ-ONLY)                #
+################################################################################
+#
+# PURPOSE:
+# Watches both Zendure devices and the control logic WITHOUT influencing it.
+# Collects statistics (7 days / 24 h), compares the Forecast.Solar forecast with
+# the effective PV yield, and turns it into plain-text suggestions
+# (sensor.zendure_advisor, attribute "text").
+#
+# READ-ONLY GUARANTEE:
+# - No rest_command, no write to any control helper, no change of a setting.
+# - The only automation writes one own helper (input_datetime.zmon_started).
+# - All sensors read existing entities from zendure.yaml, zendure_device2.yaml,
+#   zendure_coordinator.yaml, zendure_extended.yaml and energy_monitoring.yaml.
+#
+# SETUP:
+# 1. Save as packages/zendure_monitoring.yaml, check the configuration, restart.
+# 2. Forecast.Solar sensors: device 1 = sensor.energy_production_*_2,
+#    device 2 = sensor.energy_production_* (as in your control files). If they
+#    are swapped, change the two helpers "Zmon: Forecast.Solar suffix ..." (the
+#    value is appended to the sensor name, e.g. "_2" or empty).
+#    Needed sensors: energy_production_today, energy_production_today_remaining.
+# 3. The recorder must keep at least 8 days (default 10 days is fine).
+# 4. Hints become meaningful after about 2-3 days; forecast statistics after 3+ days.
+#
+# NOTES:
+# - Thresholds of the hints (10 W discharge, 50 W import, ...) are in the
+#   binary sensors below and can be changed freely.
+# - PV "actual" is the DC input of the device. When the battery is full the
+#   device throttles PV; such days are excluded from the forecast ratio.
+#
+################################################################################
+
+input_text:
+  zmon_fc_suffix_1:
+    name: "Zmon: Forecast.Solar suffix device 1"
+    icon: mdi:solar-power
+    initial: "_2"
+    min: 0
+    max: 10
+    mode: text
+  zmon_fc_suffix_2:
+    name: "Zmon: Forecast.Solar suffix device 2"
+    icon: mdi:solar-power
+    initial: ""
+    min: 0
+    max: 10
+    mode: text
+
+input_datetime:
+  zmon_started:
+    name: "Zmon: Monitoring started"
+    has_date: true
+    has_time: true
+
+automation:
+  - alias: "Zmon: remember start time"
+    id: "zmon_remember_start"
+    trigger:
+      - platform: homeassistant
+        event: start
+    condition:
+      - condition: template
+        value_template: "{{ as_timestamp(states('input_datetime.zmon_started'), 0) < 946684800 }}"
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.zmon_started
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+utility_meter:
+  zmon_pv_1_daily:
+    source: sensor.solarflow_solar_energy_total
+    name: Zmon PV 1 daily
+    cycle: daily
+  zmon_pv_2_daily:
+    source: sensor.solarflow_2_solar_energy_total
+    name: Zmon PV 2 daily
+    cycle: daily
+  zmon_chg_1_daily:
+    source: sensor.solarflow_battery_energy_charged
+    name: Zmon charged 1 daily
+    cycle: daily
+  zmon_chg_2_daily:
+    source: sensor.solarflow_2_battery_energy_charged
+    name: Zmon charged 2 daily
+    cycle: daily
+  zmon_dis_1_daily:
+    source: sensor.solarflow_battery_energy_discharged
+    name: Zmon discharged 1 daily
+    cycle: daily
+  zmon_dis_2_daily:
+    source: sensor.solarflow_2_battery_energy_discharged
+    name: Zmon discharged 2 daily
+    cycle: daily
+
+template:
+  - binary_sensor:
+      - name: "Zmon Shelly offline"
+        unique_id: zmon_shelly_offline
+        state: >-
+          {{ not (states('sensor.power_import') | is_number and states('sensor.power_export') | is_number) }}
+      - name: "Zmon D1 offline"
+        unique_id: zmon_d1_offline
+        state: >-
+          {{ states('sensor.solarflow_status_raw') != 'OK' }}
+      - name: "Zmon D1 below cutoff"
+        unique_id: zmon_d1_below_cutoff
+        state: >-
+          {% set season = 'summer' if states('sensor.zendure_active_season') == 'summer' else 'winter' %}
+          {% set off = states('input_number.zendure_conf_soc_off_' ~ season) | int(20) %}
+          {{ states('sensor.solarflow_battery_level') | float(100) <= off }}
+        availability: >-
+          {{ states('sensor.solarflow_battery_level') | is_number }}
+      - name: "Zmon D1 violation"
+        unique_id: zmon_d1_violation
+        state: >-
+          {% set season = 'summer' if states('sensor.zendure_active_season') == 'summer' else 'winter' %}
+          {% set off = states('input_number.zendure_conf_soc_off_' ~ season) | int(20) %}
+          {{ states('sensor.solarflow_battery_level') | float(100) <= off
+             and states('sensor.solarflow_pack_output_power') | float(0) > 10 }}
+        availability: >-
+          {{ states('sensor.solarflow_battery_level') | is_number and states('sensor.solarflow_pack_output_power') | is_number }}
+      - name: "Zmon D1 full"
+        unique_id: zmon_d1_full
+        state: >-
+          {% set p = state_attr('sensor.solarflow_status_raw', 'properties') %}
+          {% set socset = (p.get('socSet', 1000) | float(1000) / 10) if p is mapping else 100 %}
+          {{ states('sensor.solarflow_battery_level') | float(0) >= socset - 1 }}
+        availability: >-
+          {{ states('sensor.solarflow_battery_level') | is_number }}
+      - name: "Zmon D2 offline"
+        unique_id: zmon_d2_offline
+        state: >-
+          {{ states('sensor.solarflow_2_status_raw') != 'OK' }}
+      - name: "Zmon D2 below cutoff"
+        unique_id: zmon_d2_below_cutoff
+        state: >-
+          {% set season = 'summer' if states('sensor.zendure_active_season') == 'summer' else 'winter' %}
+          {% set off = states('input_number.zendure_conf_soc_off_' ~ season) | int(20) %}
+          {{ states('sensor.solarflow_2_battery_level') | float(100) <= off }}
+        availability: >-
+          {{ states('sensor.solarflow_2_battery_level') | is_number }}
+      - name: "Zmon D2 violation"
+        unique_id: zmon_d2_violation
+        state: >-
+          {% set season = 'summer' if states('sensor.zendure_active_season') == 'summer' else 'winter' %}
+          {% set off = states('input_number.zendure_conf_soc_off_' ~ season) | int(20) %}
+          {{ states('sensor.solarflow_2_battery_level') | float(100) <= off
+             and states('sensor.solarflow_2_pack_output_power') | float(0) > 10 }}
+        availability: >-
+          {{ states('sensor.solarflow_2_battery_level') | is_number and states('sensor.solarflow_2_pack_output_power') | is_number }}
+      - name: "Zmon D2 full"
+        unique_id: zmon_d2_full
+        state: >-
+          {% set p = state_attr('sensor.solarflow_2_status_raw', 'properties') %}
+          {% set socset = (p.get('socSet', 1000) | float(1000) / 10) if p is mapping else 100 %}
+          {{ states('sensor.solarflow_2_battery_level') | float(0) >= socset - 1 }}
+        availability: >-
+          {{ states('sensor.solarflow_2_battery_level') | is_number }}
+      - name: "Zmon D2 locked"
+        unique_id: zmon_d2_locked
+        state: >-
+          {{ states('input_number.zendure_2_conf_discharge_release_soc') | float(0) > 0
+             and not is_state('input_boolean.zendure_2_discharge_released', 'on') }}
+      - name: "Zmon discharging"
+        unique_id: zmon_discharging
+        state: >-
+          {{ (states('sensor.solarflow_pack_output_power') | float(0)
+              + states('sensor.solarflow_2_pack_output_power') | float(0)) > 10 }}
+        availability: >-
+          {{ states('sensor.solarflow_pack_output_power') | is_number }}
+      - name: "Zmon unused reserve"
+        unique_id: zmon_unused_reserve
+        state: >-
+          {% set season = 'summer' if states('sensor.zendure_active_season') == 'summer' else 'winter' %}
+          {% set off = states('input_number.zendure_conf_soc_off_' ~ season) | int(20) %}
+          {% set imp = states('sensor.power_import') | float(0) %}
+          {% set exp = states('sensor.power_export') | float(0) %}
+          {% set dis = states('sensor.solarflow_pack_output_power') | float(0)
+                       + states('sensor.solarflow_2_pack_output_power') | float(0) %}
+          {% set u1 = states('sensor.solarflow_status_raw') == 'OK'
+                      and is_state('input_boolean.zendure_enabled', 'on')
+                      and is_state('input_boolean.zendure_emergency_charge', 'off')
+                      and is_state('input_boolean.zendure_calibration_mode', 'off')
+                      and states('sensor.solarflow_battery_level') | float(0) > off + 2 %}
+          {% set u2 = states('sensor.solarflow_2_status_raw') == 'OK'
+                      and is_state('input_boolean.zendure_2_enabled', 'on')
+                      and is_state('input_boolean.zendure_2_emergency_charge', 'off')
+                      and is_state('input_boolean.zendure_2_calibration_mode', 'off')
+                      and states('sensor.solarflow_2_battery_level') | float(0) > off + 2
+                      and not (states('input_number.zendure_2_conf_discharge_release_soc') | float(0) > 0
+                               and not is_state('input_boolean.zendure_2_discharge_released', 'on')) %}
+          {{ is_state('input_boolean.zendure_auto_mode', 'on')
+             and imp > 50 and dis < 20 and (u1 or u2) }}
+        availability: >-
+          {{ states('sensor.power_import') | is_number and states('sensor.power_export') | is_number }}
+      - name: "Zmon export while discharging"
+        unique_id: zmon_export_while_discharging
+        state: >-
+          {% set season = 'summer' if states('sensor.zendure_active_season') == 'summer' else 'winter' %}
+          {% set off = states('input_number.zendure_conf_soc_off_' ~ season) | int(20) %}
+          {% set imp = states('sensor.power_import') | float(0) %}
+          {% set exp = states('sensor.power_export') | float(0) %}
+          {% set dis = states('sensor.solarflow_pack_output_power') | float(0)
+                       + states('sensor.solarflow_2_pack_output_power') | float(0) %}
+          {% set u1 = states('sensor.solarflow_status_raw') == 'OK'
+                      and is_state('input_boolean.zendure_enabled', 'on')
+                      and is_state('input_boolean.zendure_emergency_charge', 'off')
+                      and is_state('input_boolean.zendure_calibration_mode', 'off')
+                      and states('sensor.solarflow_battery_level') | float(0) > off + 2 %}
+          {% set u2 = states('sensor.solarflow_2_status_raw') == 'OK'
+                      and is_state('input_boolean.zendure_2_enabled', 'on')
+                      and is_state('input_boolean.zendure_2_emergency_charge', 'off')
+                      and is_state('input_boolean.zendure_2_calibration_mode', 'off')
+                      and states('sensor.solarflow_2_battery_level') | float(0) > off + 2
+                      and not (states('input_number.zendure_2_conf_discharge_release_soc') | float(0) > 0
+                               and not is_state('input_boolean.zendure_2_discharge_released', 'on')) %}
+          {{ exp > 30 and dis > 10 }}
+        availability: >-
+          {{ states('sensor.power_import') | is_number and states('sensor.power_export') | is_number }}
+      - name: "Zmon import while discharging"
+        unique_id: zmon_import_while_discharging
+        state: >-
+          {% set season = 'summer' if states('sensor.zendure_active_season') == 'summer' else 'winter' %}
+          {% set off = states('input_number.zendure_conf_soc_off_' ~ season) | int(20) %}
+          {% set imp = states('sensor.power_import') | float(0) %}
+          {% set exp = states('sensor.power_export') | float(0) %}
+          {% set dis = states('sensor.solarflow_pack_output_power') | float(0)
+                       + states('sensor.solarflow_2_pack_output_power') | float(0) %}
+          {% set u1 = states('sensor.solarflow_status_raw') == 'OK'
+                      and is_state('input_boolean.zendure_enabled', 'on')
+                      and is_state('input_boolean.zendure_emergency_charge', 'off')
+                      and is_state('input_boolean.zendure_calibration_mode', 'off')
+                      and states('sensor.solarflow_battery_level') | float(0) > off + 2 %}
+          {% set u2 = states('sensor.solarflow_2_status_raw') == 'OK'
+                      and is_state('input_boolean.zendure_2_enabled', 'on')
+                      and is_state('input_boolean.zendure_2_emergency_charge', 'off')
+                      and is_state('input_boolean.zendure_2_calibration_mode', 'off')
+                      and states('sensor.solarflow_2_battery_level') | float(0) > off + 2
+                      and not (states('input_number.zendure_2_conf_discharge_release_soc') | float(0) > 0
+                               and not is_state('input_boolean.zendure_2_discharge_released', 'on')) %}
+          {% set n = (1 if u1 else 0) + (1 if u2 else 0) %}
+          {% set mx = states('input_number.zendure_conf_max_output') | float(600) %}
+          {{ n > 0 and imp > 60 and dis > 10 and dis < (mx * n - 50) }}
+        availability: >-
+          {{ states('sensor.power_import') | is_number and states('sensor.power_export') | is_number }}
+
+  - trigger:
+      - platform: time
+        at: "23:55:00"
+    variables:
+      act1: "{{ states('sensor.zmon_pv_1_daily') | float(0) }}"
+      act2: "{{ states('sensor.zmon_pv_2_daily') | float(0) }}"
+      fc1: "{{ states('sensor.energy_production_today' ~ states('input_text.zmon_fc_suffix_1')) | float(0) }}"
+      fc2: "{{ states('sensor.energy_production_today' ~ states('input_text.zmon_fc_suffix_2')) | float(0) }}"
+      lim1: "{{ states('sensor.zmon_d1_full_today') | float(0) }}"
+      lim2: "{{ states('sensor.zmon_d2_full_today') | float(0) }}"
+    sensor:
+      - name: "Zmon PV actual 1 day"
+        unique_id: zmon_pv_actual_1_day
+        unit_of_measurement: "kWh"
+        state_class: measurement
+        state: "{{ act1 | round(2) }}"
+        attributes:
+          date: "{{ now().strftime('%Y-%m-%d') }}"
+      - name: "Zmon PV forecast 1 day"
+        unique_id: zmon_pv_forecast_1_day
+        unit_of_measurement: "kWh"
+        state_class: measurement
+        state: "{{ fc1 | round(2) }}"
+        attributes:
+          date: "{{ now().strftime('%Y-%m-%d') }}"
+      # Ratio actual/forecast in %. Days on which the battery was full for an hour or more
+      # are left out (unknown): the device then throttles PV, so "actual" is not comparable.
+      - name: "Zmon PV ratio 1"
+        unique_id: zmon_pv_ratio_1
+        unit_of_measurement: "%"
+        state_class: measurement
+        state: >-
+          {% if fc1 >= 1 and lim1 < 1 %}{{ (act1 / fc1 * 100) | round(1) }}{% else %}unknown{% endif %}
+        attributes:
+          date: "{{ now().strftime('%Y-%m-%d') }}"
+          limited: "{{ lim1 >= 1 }}"
+          actual_kwh: "{{ act1 | round(2) }}"
+          forecast_kwh: "{{ fc1 | round(2) }}"
+      - name: "Zmon PV actual 2 day"
+        unique_id: zmon_pv_actual_2_day
+        unit_of_measurement: "kWh"
+        state_class: measurement
+        state: "{{ act2 | round(2) }}"
+        attributes:
+          date: "{{ now().strftime('%Y-%m-%d') }}"
+      - name: "Zmon PV forecast 2 day"
+        unique_id: zmon_pv_forecast_2_day
+        unit_of_measurement: "kWh"
+        state_class: measurement
+        state: "{{ fc2 | round(2) }}"
+        attributes:
+          date: "{{ now().strftime('%Y-%m-%d') }}"
+      # Ratio actual/forecast in %. Days on which the battery was full for an hour or more
+      # are left out (unknown): the device then throttles PV, so "actual" is not comparable.
+      - name: "Zmon PV ratio 2"
+        unique_id: zmon_pv_ratio_2
+        unit_of_measurement: "%"
+        state_class: measurement
+        state: >-
+          {% if fc2 >= 1 and lim2 < 1 %}{{ (act2 / fc2 * 100) | round(1) }}{% else %}unknown{% endif %}
+        attributes:
+          date: "{{ now().strftime('%Y-%m-%d') }}"
+          limited: "{{ lim2 >= 1 }}"
+          actual_kwh: "{{ act2 | round(2) }}"
+          forecast_kwh: "{{ fc2 | round(2) }}"
+
+  - sensor:
+      - name: "Zmon PV deviation 1 live"
+        unique_id: zmon_pv_deviation_1_live
+        unit_of_measurement: "%"
+        state: >-
+          {% set tot = states('sensor.energy_production_today' ~ states('input_text.zmon_fc_suffix_1')) | float(-1) %}
+          {% set rem = states('sensor.energy_production_today_remaining' ~ states('input_text.zmon_fc_suffix_1')) | float(-1) %}
+          {% set act = states('sensor.zmon_pv_1_daily') | float(0) %}
+          {% set sofar = tot - rem %}
+          {% if tot < 0 or rem < 0 or sofar < 0.3 %}unknown{% else %}{{ ((act / sofar - 1) * 100) | round(0) }}{% endif %}
+        attributes:
+          actual_kwh: >-
+            {% set tot = states('sensor.energy_production_today' ~ states('input_text.zmon_fc_suffix_1')) | float(-1) %}
+            {% set rem = states('sensor.energy_production_today_remaining' ~ states('input_text.zmon_fc_suffix_1')) | float(-1) %}
+            {% set act = states('sensor.zmon_pv_1_daily') | float(0) %}
+            {% set sofar = tot - rem %}
+            {{ act | round(2) }}
+          forecast_so_far_kwh: >-
+            {% set tot = states('sensor.energy_production_today' ~ states('input_text.zmon_fc_suffix_1')) | float(-1) %}
+            {% set rem = states('sensor.energy_production_today_remaining' ~ states('input_text.zmon_fc_suffix_1')) | float(-1) %}
+            {% set act = states('sensor.zmon_pv_1_daily') | float(0) %}
+            {% set sofar = tot - rem %}
+            {{ sofar | round(2) }}
+          forecast_total_kwh: >-
+            {% set tot = states('sensor.energy_production_today' ~ states('input_text.zmon_fc_suffix_1')) | float(-1) %}
+            {% set rem = states('sensor.energy_production_today_remaining' ~ states('input_text.zmon_fc_suffix_1')) | float(-1) %}
+            {% set act = states('sensor.zmon_pv_1_daily') | float(0) %}
+            {% set sofar = tot - rem %}
+            {{ tot | round(2) }}
+      - name: "Zmon PV deviation 2 live"
+        unique_id: zmon_pv_deviation_2_live
+        unit_of_measurement: "%"
+        state: >-
+          {% set tot = states('sensor.energy_production_today' ~ states('input_text.zmon_fc_suffix_2')) | float(-1) %}
+          {% set rem = states('sensor.energy_production_today_remaining' ~ states('input_text.zmon_fc_suffix_2')) | float(-1) %}
+          {% set act = states('sensor.zmon_pv_2_daily') | float(0) %}
+          {% set sofar = tot - rem %}
+          {% if tot < 0 or rem < 0 or sofar < 0.3 %}unknown{% else %}{{ ((act / sofar - 1) * 100) | round(0) }}{% endif %}
+        attributes:
+          actual_kwh: >-
+            {% set tot = states('sensor.energy_production_today' ~ states('input_text.zmon_fc_suffix_2')) | float(-1) %}
+            {% set rem = states('sensor.energy_production_today_remaining' ~ states('input_text.zmon_fc_suffix_2')) | float(-1) %}
+            {% set act = states('sensor.zmon_pv_2_daily') | float(0) %}
+            {% set sofar = tot - rem %}
+            {{ act | round(2) }}
+          forecast_so_far_kwh: >-
+            {% set tot = states('sensor.energy_production_today' ~ states('input_text.zmon_fc_suffix_2')) | float(-1) %}
+            {% set rem = states('sensor.energy_production_today_remaining' ~ states('input_text.zmon_fc_suffix_2')) | float(-1) %}
+            {% set act = states('sensor.zmon_pv_2_daily') | float(0) %}
+            {% set sofar = tot - rem %}
+            {{ sofar | round(2) }}
+          forecast_total_kwh: >-
+            {% set tot = states('sensor.energy_production_today' ~ states('input_text.zmon_fc_suffix_2')) | float(-1) %}
+            {% set rem = states('sensor.energy_production_today_remaining' ~ states('input_text.zmon_fc_suffix_2')) | float(-1) %}
+            {% set act = states('sensor.zmon_pv_2_daily') | float(0) %}
+            {% set sofar = tot - rem %}
+            {{ tot | round(2) }}
+
+  # Advisor: computed once per run (variables) and published as state + attributes.
+  - trigger:
+      - platform: time_pattern
+        minutes: "/5"
+      - platform: homeassistant
+        event: start
+    variables:
+      advice: >-
+        {% set ns = namespace(w=[], i=[]) %}
+        {# ---------- Settings and base values ---------- #}
+        {% set season = 'summer' if states('sensor.zendure_active_season') == 'summer' else 'winter' %}
+        {% set off = states('input_number.zendure_conf_soc_off_' ~ season) | int(20) %}
+        {% set stop = states('input_number.zendure_conf_soc_emerg_stop') | int(15) %}
+        {% set hyst = states('input_number.zendure_conf_hysteresis') | int(5) %}
+        {% set bias = states('input_number.zendure_conf_grid_bias_' ~ season) | int(0) %}
+        {% set fs = states('input_number.zendure_conf_failsafe_watt') | int(130) %}
+        {% set thresh = states('input_number.zendure_conf_forecast_thresh') | float(2.5) %}
+        {% set calib = states('input_number.zendure_conf_calib_days') | int(7) %}
+        {% set pvf = states('input_number.zendure_2_conf_pv_factor') | float(0.25) %}
+        {% set rel = states('input_number.zendure_2_conf_discharge_release_soc') | float(0) %}
+        {% set started = as_timestamp(states('input_datetime.zmon_started'), 0) %}
+        {% set days = ((as_timestamp(now()) - started) / 86400) if started > 946684800 else 0 %}
+
+        {# ---------- Data basis ---------- #}
+        {% if days < 2 %}
+          {% set ns.i = ns.i + ['INFO: Data collection has been running for ' ~ ((days * 24) | round(0) | int) ~ ' h. Meaningful hints are available after about 2 to 3 days.'] %}
+        {% endif %}
+
+        {# ---------- A) Safety and operation ---------- #}
+        {% for i in [1, 2] %}
+          {% set v = states('sensor.zmon_d' ~ i ~ '_violation_24h') | float(0) %}
+          {% if v >= 0.1 %}
+            {% set ns.w = ns.w + ['WARNING: Device ' ~ i ~ ' discharged at more than 10 W for ' ~ (v | round(1)) ~ ' h in the last 24 h while below the cutoff (' ~ off ~ ' %). Check: Is the control loop running? Was the Shelly offline (failsafe)? Is minSoc in the device set too low?'] %}
+          {% endif %}
+          {% set o = states('sensor.zmon_d' ~ i ~ '_offline_7d') | float(0) %}
+          {% if o >= 0.5 %}
+            {% set ns.w = ns.w + ['WARNING: Device ' ~ i ~ ' was unreachable for ' ~ (o | round(1)) ~ ' h in the last 7 days. Check: WiFi reception, IP address, router block.'] %}
+          {% endif %}
+        {% endfor %}
+        {% set sh = states('sensor.zmon_shelly_offline_7d') | float(0) %}
+        {% if sh >= 0.5 %}
+          {% set ns.w = ns.w + ['WARNING: The Shelly meter was offline for ' ~ (sh | round(1)) ~ ' h in the last 7 days (failsafe with ' ~ fs ~ ' W per device active). Check: WiFi and power supply of the Shelly.'] %}
+        {% endif %}
+        {% if is_state('input_boolean.zendure_dry_run', 'on') %}
+          {% set ns.w = ns.w + ['NOTE: The coordinator dry run is on, nothing is written to the devices.'] %}
+        {% endif %}
+        {% if is_state('input_boolean.zendure_auto_mode', 'off') %}
+          {% set ns.w = ns.w + ['NOTE: Auto mode is off, the control loop of device 1 is not running.'] %}
+        {% endif %}
+        {% if is_state('input_boolean.zendure_coordinator_enabled', 'on') %}
+          {% set tick = states('sensor.zendure_seconds_since_last_tick') | float(-1) %}
+          {% if tick > 60 %}
+            {% set ns.w = ns.w + ['WARNING: The coordinator has not completed a cycle for ' ~ (tick | round(0) | int) ~ ' s. Check: automation Zendure Multi Coordinator.'] %}
+          {% endif %}
+        {% elif is_state('input_boolean.zendure_2_enabled', 'on') %}
+          {% set ns.w = ns.w + ['WARNING: The coordinator is off, device 2 is not controlled by any control loop.'] %}
+        {% endif %}
+
+        {# ---------- B) Plausibility of settings ---------- #}
+        {% if stop <= off %}
+          {% set ns.w = ns.w + ['CHECK: Emergency charging ends at ' ~ stop ~ ' %, which is not above the cutoff (' ~ off ~ ' %). The battery stays locked afterwards until PV charges it above ' ~ off ~ ' %. If it should be usable after emergency charging, set the stop value to at least ' ~ (off + 1) ~ ' %.'] %}
+        {% endif %}
+        {% if rel > 0 and rel <= off %}
+          {% set ns.w = ns.w + ['CHECK: The release threshold of device 2 (' ~ (rel | int) ~ ' %) is not above the cutoff (' ~ off ~ ' %). Charge-first then has no effect.'] %}
+        {% endif %}
+        {% if hyst > 15 %}
+          {% set ns.w = ns.w + ['CHECK: The hysteresis of ' ~ hyst ~ ' W is large (default 5 W). Small load changes are not regulated out.'] %}
+        {% endif %}
+        {% set fc1 = states('sensor.energy_production_today' ~ states('input_text.zmon_fc_suffix_1')) | float(0) %}
+        {% set fc2 = states('sensor.energy_production_today' ~ states('input_text.zmon_fc_suffix_2')) | float(0) %}
+        {% if fc1 >= 1 and fc2 >= 0.2 %}
+          {% set r = fc2 / fc1 %}
+          {% if r > 1 %}
+            {% set ns.w = ns.w + ['CHECK: The forecast for device 2 today (' ~ (fc2 | round(1)) ~ ' kWh) is higher than for device 1 (' ~ (fc1 | round(1)) ~ ' kWh), although device 1 has more panels. Are the forecast sensors (suffix) swapped?'] %}
+          {% elif r > pvf * 1.6 or r < pvf * 0.6 %}
+            {% set ns.w = ns.w + ['CHECK: The forecast ratio device 2 to device 1 is ' ~ (r | round(2)) ~ ', the PV factor is set to ' ~ pvf ~ '. Adjust the factor to about ' ~ (r | round(2)) ~ ' or check the forecast assignment.'] %}
+          {% endif %}
+        {% endif %}
+
+        {# ---------- C) Evaluation of the last days ---------- #}
+        {% if days >= 2 %}
+          {% for i in [1, 2] %}
+            {% set cr = states('sensor.zmon_d' ~ i ~ '_below_cutoff_7d') | float(0) %}
+            {% if cr > 60 %}
+              {% set ns.w = ns.w + ['NOTE: Device ' ~ i ~ ' was below the cutoff (' ~ off ~ ' %) for ' ~ (cr | round(0) | int) ~ ' % of the time. Options: lower the cutoff, more grid charging in the low-tariff window, or let emergency charging charge above the cutoff.'] %}
+            {% endif %}
+            {% set fcnt = states('sensor.zmon_d' ~ i ~ '_full_count_7d') | float(0) %}
+            {% if days >= 5 and fcnt < 1 %}
+              {% set ns.w = ns.w + ['NOTE: Device ' ~ i ~ ' never charged fully in 7 days.'] %}
+            {% endif %}
+            {% set ec = states('sensor.zmon_d' ~ i ~ '_emergency_count_7d') | float(0) %}
+            {% if ec >= 3 %}
+              {% set ns.w = ns.w + ['NOTE: Device ' ~ i ~ ' was emergency-charged from the grid ' ~ (ec | int) ~ ' times in 7 days (' ~ (states('sensor.zmon_d' ~ i ~ '_emergency_time_7d') | float(0) | round(1)) ~ ' h). Check the emergency charge threshold and forecast accuracy.'] %}
+            {% endif %}
+            {% set cc = states('sensor.zmon_d' ~ i ~ '_calibration_count_7d') | float(0) %}
+            {% if cc >= 2 %}
+              {% set ns.w = ns.w + ['NOTE: Device ' ~ i ~ ' ran ' ~ (cc | int) ~ ' calibrations in 7 days. More frequent full charges would avoid this.'] %}
+            {% endif %}
+          {% endfor %}
+          {% for i, ent in [(1, 'input_datetime.zendure_last_full_charge'), (2, 'input_datetime.zendure_2_last_full_charge')] %}
+            {% set lf = as_timestamp(states(ent), 0) %}
+            {% if lf > 946684800 %}
+              {% set d = (as_timestamp(now()) - lf) / 86400 %}
+              {% if d >= calib * 0.7 and d < calib %}
+                {% set ns.w = ns.w + ['NOTE: Device ' ~ i ~ ' has had no full charge for ' ~ (d | round(1)) ~ ' days, calibration starts after ' ~ calib ~ ' days.'] %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {% if rel > 0 %}
+            {% set lr = states('sensor.zmon_d2_locked_7d') | float(0) %}
+            {% if days >= 3 and lr > 95 %}
+              {% set ns.w = ns.w + ['NOTE: Device 2 was locked (charge-first) for ' ~ (lr | round(0) | int) ~ ' % of the time and hardly delivered anything. Lower the threshold (' ~ (rel | int) ~ ' %) or set it to 0 as long as PV is not sufficient.'] %}
+            {% endif %}
+          {% endif %}
+          {% set dh = states('sensor.zmon_discharging_7d') | float(0) %}
+          {% set ew = states('sensor.zmon_export_while_discharging_7d') | float(0) %}
+          {% if dh >= 2 and ew >= 0.5 and ew / dh > 0.05 %}
+            {% set ns.w = ns.w + ['NOTE: The battery fed into the grid for ' ~ (ew | round(1)) ~ ' h in 7 days (' ~ ((ew / dh * 100) | round(0) | int) ~ ' % of the discharge time). Increase grid bias (currently ' ~ bias ~ ' W).'] %}
+          {% endif %}
+          {% set iw = states('sensor.zmon_import_while_discharging_7d') | float(0) %}
+          {% if dh >= 2 and iw / dh > 0.25 %}
+            {% set ns.w = ns.w + ['NOTE: During discharge, grid import above 60 W persisted for ' ~ ((iw / dh * 100) | round(0) | int) ~ ' % of the time. Check hysteresis (' ~ hyst ~ ' W) and grid bias (' ~ bias ~ ' W) or the maximum power.'] %}
+          {% endif %}
+          {% set ur = states('sensor.zmon_unused_reserve_7d') | float(0) %}
+          {% if ur >= 3 %}
+            {% set ns.w = ns.w + ['NOTE: ' ~ (ur | round(1)) ~ ' h of grid import above 50 W although a usable battery was available and delivered nothing. Possible causes: bypass threshold, hysteresis, charge-first lock.'] %}
+          {% endif %}
+        {% endif %}
+
+        {# ---------- D) Forecast vs. actual PV ---------- #}
+        {% for i in [1, 2] %}
+          {% set n = states('sensor.zmon_pv_ratio_' ~ i ~ '_days') | int(0) %}
+          {% set r = states('sensor.zmon_pv_ratio_' ~ i ~ '_avg7') | float(0) %}
+          {% if n >= 3 %}
+            {% set teff = thresh if i == 1 else (thresh * pvf) %}
+            {% set how = '' if i == 1 else ' Effective value is threshold times PV factor.' %}
+            {% if r < 70 %}
+              {% set sug = (teff / ([r, 40] | max / 100)) | round(1) %}
+              {% set ns.w = ns.w + ['NOTE: The forecast for device ' ~ i ~ ' is too optimistic. On average only ' ~ (r | round(0) | int) ~ ' % actually arrived (' ~ n ~ ' days without a full battery). The emergency charge threshold (effective ' ~ (teff | round(2)) ~ ' kWh) therefore triggers too rarely. Suggestion: about ' ~ sug ~ ' kWh.' ~ how] %}
+            {% elif r > 130 %}
+              {% set sug = (teff / ([r, 150] | min / 100)) | round(1) %}
+              {% set ns.w = ns.w + ['NOTE: The forecast for device ' ~ i ~ ' is too pessimistic. On average ' ~ (r | round(0) | int) ~ ' % actually arrived (' ~ n ~ ' days). The emergency charge threshold (effective ' ~ (teff | round(2)) ~ ' kWh) therefore may trigger too often. Suggestion: about ' ~ sug ~ ' kWh.' ~ how] %}
+            {% endif %}
+          {% elif days >= 2 %}
+            {% set ns.i = ns.i + ['INFO: For the forecast comparison of device ' ~ i ~ ' only ' ~ n ~ ' evaluable days are available so far (required: 3, days with a full battery do not count).'] %}
+          {% endif %}
+        {% endfor %}
+
+        {# ---------- Result ---------- #}
+        {% set lines = ns.w + ns.i %}
+        {% if ns.w | length == 0 and days >= 2 %}
+          {% set lines = ['OK: No anomalies in the evaluated data.'] + ns.i %}
+        {% endif %}
+        {% set t = namespace(s='') %}
+        {% for l in lines %}{% set t.s = t.s ~ '- ' ~ l ~ '\n' %}{% endfor %}
+        {{ {'warnings': (ns.w | length), 'lines': lines, 'text': t.s} | tojson }}
+    sensor:
+      - name: "Zendure Advisor"
+        unique_id: zendure_advisor
+        icon: mdi:lightbulb-on-outline
+        state: "{{ advice.warnings | int(0) }}"
+        attributes:
+          text: "{{ advice.text }}"
+          hints: "{{ advice.lines }}"
+          updated: "{{ now().strftime('%Y-%m-%d %H:%M') }}"
+
+sensor:
+  - platform: history_stats
+    name: "Zmon Shelly offline 7d"
+    unique_id: zmon_shelly_offline_7d
+    entity_id: binary_sensor.zmon_shelly_offline
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      days: 7
+  - platform: history_stats
+    name: "Zmon D1 offline 7d"
+    unique_id: zmon_d1_offline_7d
+    entity_id: binary_sensor.zmon_d1_offline
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      days: 7
+  - platform: history_stats
+    name: "Zmon D1 violation 24h"
+    unique_id: zmon_d1_violation_24h
+    entity_id: binary_sensor.zmon_d1_violation
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      hours: 24
+  - platform: history_stats
+    name: "Zmon D1 below cutoff 7d"
+    unique_id: zmon_d1_below_cutoff_7d
+    entity_id: binary_sensor.zmon_d1_below_cutoff
+    state: "on"
+    type: ratio
+    end: "{{ now() }}"
+    duration:
+      days: 7
+  - platform: history_stats
+    name: "Zmon D1 full count 7d"
+    unique_id: zmon_d1_full_count_7d
+    entity_id: binary_sensor.zmon_d1_full
+    state: "on"
+    type: count
+    end: "{{ now() }}"
+    duration:
+      days: 7
+  - platform: history_stats
+    name: "Zmon D1 full today"
+    unique_id: zmon_d1_full_today
+    entity_id: binary_sensor.zmon_d1_full
+    state: "on"
+    type: time
+    start: "{{ now().replace(hour=0, minute=0, second=0, microsecond=0) }}"
+    end: "{{ now() }}"
+  - platform: history_stats
+    name: "Zmon D1 emergency count 7d"
+    unique_id: zmon_d1_emergency_count_7d
+    entity_id: input_boolean.zendure_emergency_charge
+    state: "on"
+    type: count
+    end: "{{ now() }}"
+    duration:
+      days: 7
+  - platform: history_stats
+    name: "Zmon D1 emergency time 7d"
+    unique_id: zmon_d1_emergency_time_7d
+    entity_id: input_boolean.zendure_emergency_charge
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      days: 7
+  - platform: history_stats
+    name: "Zmon D1 calibration count 7d"
+    unique_id: zmon_d1_calibration_count_7d
+    entity_id: input_boolean.zendure_calibration_mode
+    state: "on"
+    type: count
+    end: "{{ now() }}"
+    duration:
+      days: 7
+  - platform: history_stats
+    name: "Zmon D2 offline 7d"
+    unique_id: zmon_d2_offline_7d
+    entity_id: binary_sensor.zmon_d2_offline
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      days: 7
+  - platform: history_stats
+    name: "Zmon D2 violation 24h"
+    unique_id: zmon_d2_violation_24h
+    entity_id: binary_sensor.zmon_d2_violation
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      hours: 24
+  - platform: history_stats
+    name: "Zmon D2 below cutoff 7d"
+    unique_id: zmon_d2_below_cutoff_7d
+    entity_id: binary_sensor.zmon_d2_below_cutoff
+    state: "on"
+    type: ratio
+    end: "{{ now() }}"
+    duration:
+      days: 7
+  - platform: history_stats
+    name: "Zmon D2 full count 7d"
+    unique_id: zmon_d2_full_count_7d
+    entity_id: binary_sensor.zmon_d2_full
+    state: "on"
+    type: count
+    end: "{{ now() }}"
+    duration:
+      days: 7
+  - platform: history_stats
+    name: "Zmon D2 full today"
+    unique_id: zmon_d2_full_today
+    entity_id: binary_sensor.zmon_d2_full
+    state: "on"
+    type: time
+    start: "{{ now().replace(hour=0, minute=0, second=0, microsecond=0) }}"
+    end: "{{ now() }}"
+  - platform: history_stats
+    name: "Zmon D2 emergency count 7d"
+    unique_id: zmon_d2_emergency_count_7d
+    entity_id: input_boolean.zendure_2_emergency_charge
+    state: "on"
+    type: count
+    end: "{{ now() }}"
+    duration:
+      days: 7
+  - platform: history_stats
+    name: "Zmon D2 emergency time 7d"
+    unique_id: zmon_d2_emergency_time_7d
+    entity_id: input_boolean.zendure_2_emergency_charge
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      days: 7
+  - platform: history_stats
+    name: "Zmon D2 calibration count 7d"
+    unique_id: zmon_d2_calibration_count_7d
+    entity_id: input_boolean.zendure_2_calibration_mode
+    state: "on"
+    type: count
+    end: "{{ now() }}"
+    duration:
+      days: 7
+  - platform: history_stats
+    name: "Zmon D2 locked 7d"
+    unique_id: zmon_d2_locked_7d
+    entity_id: binary_sensor.zmon_d2_locked
+    state: "on"
+    type: ratio
+    end: "{{ now() }}"
+    duration:
+      days: 7
+  - platform: history_stats
+    name: "Zmon discharging 7d"
+    unique_id: zmon_discharging_7d
+    entity_id: binary_sensor.zmon_discharging
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      days: 7
+  - platform: history_stats
+    name: "Zmon unused reserve 7d"
+    unique_id: zmon_unused_reserve_7d
+    entity_id: binary_sensor.zmon_unused_reserve
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      days: 7
+  - platform: history_stats
+    name: "Zmon export while discharging 7d"
+    unique_id: zmon_export_while_discharging_7d
+    entity_id: binary_sensor.zmon_export_while_discharging
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      days: 7
+  - platform: history_stats
+    name: "Zmon import while discharging 7d"
+    unique_id: zmon_import_while_discharging_7d
+    entity_id: binary_sensor.zmon_import_while_discharging
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      days: 7
+  - platform: statistics
+    name: "Zmon PV ratio 1 avg7"
+    unique_id: zmon_pv_ratio_1_avg7
+    entity_id: sensor.zmon_pv_ratio_1
+    state_characteristic: mean
+    max_age:
+      days: 8
+    precision: 1
+  - platform: statistics
+    name: "Zmon PV ratio 1 days"
+    unique_id: zmon_pv_ratio_1_days
+    entity_id: sensor.zmon_pv_ratio_1
+    state_characteristic: count
+    max_age:
+      days: 8
+    precision: 0
+  - platform: statistics
+    name: "Zmon D1 SoC min 24h"
+    unique_id: zmon_d1_soc_min_24h
+    entity_id: sensor.solarflow_battery_level
+    state_characteristic: value_min
+    max_age:
+      hours: 24
+    precision: 0
+  - platform: statistics
+    name: "Zmon D1 SoC min 7d"
+    unique_id: zmon_d1_soc_min_7d
+    entity_id: sensor.solarflow_battery_level
+    state_characteristic: value_min
+    max_age:
+      days: 7
+    precision: 0
+  - platform: statistics
+    name: "Zmon PV ratio 2 avg7"
+    unique_id: zmon_pv_ratio_2_avg7
+    entity_id: sensor.zmon_pv_ratio_2
+    state_characteristic: mean
+    max_age:
+      days: 8
+    precision: 1
+  - platform: statistics
+    name: "Zmon PV ratio 2 days"
+    unique_id: zmon_pv_ratio_2_days
+    entity_id: sensor.zmon_pv_ratio_2
+    state_characteristic: count
+    max_age:
+      days: 8
+    precision: 0
+  - platform: statistics
+    name: "Zmon D2 SoC min 24h"
+    unique_id: zmon_d2_soc_min_24h
+    entity_id: sensor.solarflow_2_battery_level
+    state_characteristic: value_min
+    max_age:
+      hours: 24
+    precision: 0
+  - platform: statistics
+    name: "Zmon D2 SoC min 7d"
+    unique_id: zmon_d2_soc_min_7d
+    entity_id: sensor.solarflow_2_battery_level
+    state_characteristic: value_min
+    max_age:
+      days: 7
+    precision: 0
