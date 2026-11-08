@@ -1,0 +1,129 @@
+type: vertical-stack
+cards:
+  - type: markdown
+    title: Zendure Advisor
+    content: >-
+      **{{ states('sensor.zendure_advisor') }} hint(s)** · Updated {{
+      state_attr('sensor.zendure_advisor', 'updated') }}
+
+
+      {{ state_attr('sensor.zendure_advisor', 'text') }}
+  - type: entities
+    title: Battery and control (7 days)
+    entities:
+      - type: section
+        label: Device 1
+      - entity: sensor.zmon_d1_soc_min_24h
+        name: Lowest state of charge 24 h
+      - entity: sensor.zmon_d1_soc_min_7d
+        name: Lowest state of charge 7 days
+      - entity: sensor.zmon_d1_below_cutoff_7d
+        name: Time below cutoff
+      - entity: sensor.zmon_d1_full_count_7d
+        name: Full charges
+      - entity: sensor.zmon_d1_emergency_count_7d
+        name: Emergency charges
+      - entity: sensor.zmon_d1_violation_24h
+        name: Discharge below cutoff (24 h)
+      - type: section
+        label: Device 2
+      - entity: sensor.zmon_d2_soc_min_24h
+        name: Lowest state of charge 24 h
+      - entity: sensor.zmon_d2_soc_min_7d
+        name: Lowest state of charge 7 days
+      - entity: sensor.zmon_d2_below_cutoff_7d
+        name: Time below cutoff
+      - entity: sensor.zmon_d2_locked_7d
+        name: Time locked (charge-first)
+      - entity: sensor.zmon_d2_full_count_7d
+        name: Full charges
+      - entity: sensor.zmon_d2_emergency_count_7d
+        name: Emergency charges
+      - entity: sensor.zmon_d2_violation_24h
+        name: Discharge below cutoff (24 h)
+      - type: section
+        label: Control quality
+      - entity: sensor.zmon_discharging_7d
+        name: Total discharge time
+      - entity: sensor.zmon_unused_reserve_7d
+        name: Grid import despite usable battery
+      - entity: sensor.zmon_export_while_discharging_7d
+        name: Grid export while discharging
+      - entity: sensor.zmon_import_while_discharging_7d
+        name: Grid import while discharging
+      - entity: sensor.zmon_shelly_offline_7d
+        name: Shelly offline
+  - type: entities
+    title: Forecast vs. actual PV
+    entities:
+      - type: section
+        label: Today (live)
+      - entity: sensor.zmon_pv_deviation_1_live
+        name: Device 1 deviation so far
+      - entity: sensor.zmon_pv_deviation_2_live
+        name: Device 2 deviation so far
+      - entity: sensor.zmon_pv_1_daily
+        name: Device 1 PV today
+      - entity: sensor.zmon_pv_2_daily
+        name: Device 2 PV today
+      - type: section
+        label: Average of the last days (excluding days with a full battery)
+      - entity: sensor.zmon_pv_ratio_1_avg7
+        name: Device 1 actual / forecast
+      - entity: sensor.zmon_pv_ratio_1_days
+        name: Device 1 days evaluated
+      - entity: sensor.zmon_pv_ratio_2_avg7
+        name: Device 2 actual / forecast
+      - entity: sensor.zmon_pv_ratio_2_days
+        name: Device 2 days evaluated
+  - type: custom:apexcharts-card
+    header:
+      show: true
+      title: PV per day - forecast vs. actual (kWh)
+    graph_span: 7d
+    span:
+      end: day
+    apex_config:
+      chart:
+        stacked: false
+      plotOptions:
+        bar:
+          columnWidth: 70%
+    series:
+      - entity: sensor.zmon_pv_forecast_1_day
+        name: Forecast device 1
+        type: column
+        group_by:
+          func: last
+          duration: 1d
+      - entity: sensor.zmon_pv_actual_1_day
+        name: Actual device 1
+        type: column
+        group_by:
+          func: last
+          duration: 1d
+      - entity: sensor.zmon_pv_forecast_2_day
+        name: Forecast device 2
+        type: column
+        group_by:
+          func: last
+          duration: 1d
+      - entity: sensor.zmon_pv_actual_2_day
+        name: Actual device 2
+        type: column
+        group_by:
+          func: last
+          duration: 1d
+  - type: custom:apexcharts-card
+    header:
+      show: true
+      title: State of charge of both devices (%)
+    graph_span: 3d
+    yaxis:
+      - min: 0
+        max: 100
+    series:
+      - entity: sensor.solarflow_battery_level
+        name: Device 1
+      - entity: sensor.solarflow_2_battery_level
+        name: Device 2
