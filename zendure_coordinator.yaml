@@ -54,6 +54,12 @@
 #        Device 1 is the reference (factor 1). max_output is NOT scaled: it
 #        depends on the inverter, not on the battery capacity.
 #        Defaults: capacity factor 0.5, PV factor 0.25 (385 Wp vs. ~1600 Wp).
+# FIX 11: Assist. Charge-first normally keeps device 2 at 0 W until its release level. If the other
+#         devices cannot cover the demand (sensor.zendure_assist_deficit above the configured
+#         threshold for a few minutes), binary_sensor.zendure_2_assist_request lifts the lock.
+#         The seasonal bypass limit replaces the single one (winter = cutoff, no PV-only zone).
+# FIX 8: The temperature used for the winter protection is the coldest valid value of
+#        device and pack sensors (the old sensor id did not exist -> always 20 degrees).
 # FIX 7: Charge-first mode for device 2. While input_number.zendure_2_conf_
 #        discharge_release_soc is > 0 and input_boolean.zendure_2_discharge_
 #        released is off, device 2 gets a cap of 0 W (its PV goes into the
@@ -153,7 +159,8 @@ automation:
           grid_bias: "{{ states('input_number.zendure_conf_grid_bias_' ~ season) | int }}"
           # FIX 1: fallback 20 instead of 0 (an unavailable helper made the cutoff 0 %).
           soc_off: "{{ states('input_number.zendure_conf_soc_off_' ~ season) | int(20) }}"
-          soc_bypass: "{{ states('input_number.zendure_conf_soc_bypass') | int }}"
+          # FIX 11: seasonal bypass limit (see zendure.yaml)
+          soc_bypass: "{{ states('input_number.zendure_conf_soc_bypass' ~ ('_winter' if season == 'winter' else '')) | int(20) }}"
           emergency_watt: "{{ states('input_number.zendure_conf_emergency_watt') | int }}"
 
           devices:
@@ -169,7 +176,14 @@ automation:
               battery: "{{ states('sensor.solarflow_battery_level') | float(0) }}"
               current_limit: "{{ states('sensor.solarflow_output_limit') | float(0) }}"
               solar: "{{ states('sensor.solarflow_solar_input') | float(0) }}"
-              temp: "{{ states('sensor.solarflow_device_temp') | float(20) }}"
+              # FIX 8: coldest valid temperature of device and packs (see zendure.yaml)
+              temp: >-
+                {% set p = state_attr('sensor.solarflow_status_raw', 'properties') %}
+                {% set raw = (p.get('hyperTmp', 2931) | float(2931)) if p is mapping else 2931 %}
+                {% set hub = ((raw - 2731) / 10) if raw > 2000 else 20 %}
+                {% set packs = [states('sensor.solarflow_pack_1_temperature'), states('sensor.solarflow_pack_2_temperature')]
+                               | select('is_number') | map('float') | select('gt', -40) | select('lt', 80) | list %}
+                {{ ([hub] + packs) | min }}
               last_sent: "{{ states('input_number.zendure_last_sent_limit') | int }}"
               force_charge: >-
                 {{ is_state('input_boolean.zendure_emergency_charge', 'on')
@@ -198,7 +212,14 @@ automation:
               battery: "{{ states('sensor.solarflow_2_battery_level') | float(0) }}"
               current_limit: "{{ states('sensor.solarflow_2_output_limit') | float(0) }}"
               solar: "{{ states('sensor.solarflow_2_solar_input') | float(0) }}"
-              temp: "{{ states('sensor.solarflow_2_device_temp') | float(20) }}"
+              # FIX 8: coldest valid temperature of device 2 and its pack
+              temp: >-
+                {% set p = state_attr('sensor.solarflow_2_status_raw', 'properties') %}
+                {% set raw = (p.get('hyperTmp', 2931) | float(2931)) if p is mapping else 2931 %}
+                {% set hub = ((raw - 2731) / 10) if raw > 2000 else 20 %}
+                {% set packs = [states('sensor.solarflow_2_pack_1_temperature')]
+                               | select('is_number') | map('float') | select('gt', -40) | select('lt', 80) | list %}
+                {{ ([hub] + packs) | min }}
               last_sent: "{{ states('input_number.zendure_2_last_sent_limit') | int }}"
               force_charge: >-
                 {{ is_state('input_boolean.zendure_2_emergency_charge', 'on')
@@ -212,7 +233,8 @@ automation:
               saturation: "{{ (saturation_watt | int * states('input_number.zendure_2_conf_pv_factor') | float(0.25)) | int }}"
               emergency: "{{ (emergency_watt | int * states('input_number.zendure_2_conf_capacity_factor') | float(0.5)) | int }}"
               # FIX 7: charge-first lock (release level > 0 and not yet released)
-              discharge_lock: "{{ states('input_number.zendure_2_conf_discharge_release_soc') | float(0) > 0 and not is_state('input_boolean.zendure_2_discharge_released', 'on') }}"
+              # FIX 11: assist (binary_sensor.zendure_2_assist_request) lifts the lock while device 1 cannot cover the demand
+              discharge_lock: "{{ states('input_number.zendure_2_conf_discharge_release_soc') | float(0) > 0 and not is_state('input_boolean.zendure_2_discharge_released', 'on') and not is_state('binary_sensor.zendure_2_assist_request', 'on') }}"
 
       # ------------------------------------------------------------------
       # Phase 2: per-device drift correction (self-healing memory).
@@ -679,6 +701,20 @@ template:
           {% set m = trigger.event.data.allocations
                      | selectattr('id', 'eq', 2) | list %}
           {{ m[0].limit if m else 0 }}
+
+      # FIX 11: how much demand the other devices (without device 2) cannot deliver:
+      # fleet target minus the sum of the caps of all devices except device 2.
+      # Used by binary_sensor.zendure_2_assist_request (zendure_device2.yaml).
+      - name: "Zendure Assist Deficit"
+        unique_id: zendure_assist_deficit
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {% if trigger.event.data.is_failsafe %}0{% else %}
+          {% set others = trigger.event.data.devices
+                          | rejectattr('id', 'eq', 2) | map(attribute='cap') | map('float', 0) | sum %}
+          {{ ((trigger.event.data.target_total | float(0)) - others) | round(0) | int }}
+          {% endif %}
 
 
   # ----------------------------------------------------------------------

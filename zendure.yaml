@@ -42,6 +42,13 @@
 #        value was within the hysteresis band (e.g. 3 W stayed at 3 W forever).
 # FIX 4: Drift self-correction only runs while the device is reachable.
 # FIX 5: Emergency-charge stop level is clamped to at least start+1 (no flapping).
+# FIX 11: Winter defaults: cutoff 12 %, grid bias 15 W; seasonal bypass limit (winter 12, summer 20).
+# FIX 10: Forecast correction factor (zendure_conf_forecast_factor, default 80 %) for the
+#         emergency-charge decision of both devices.
+# FIX 9: The emergency/calibration charge command is re-sent every 5 minutes (heartbeat)
+#        if the device does not report it; before, it was sent exactly once.
+# FIX 8: Winter protection uses the coldest valid temperature of device and packs
+#        (the old sensor id did not exist, so the protection never triggered).
 #
 ################################################################################
 
@@ -56,6 +63,7 @@ input_text:
   zendure_device_ip:
     name: "Zendure: Device IP Address"
     icon: mdi:ip-network
+    initial: "192.168.1.100"
     pattern: "^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$"
     mode: text
 
@@ -161,7 +169,7 @@ input_number:
     min: -100
     max: 100
     step: 5
-    initial: 10
+    initial: 15
     unit_of_measurement: "W"
     mode: box
 
@@ -201,7 +209,7 @@ input_number:
     icon: mdi:battery-off
     min: 0
     max: 30
-    initial: 20
+    initial: 15
     unit_of_measurement: "%"
 
   zendure_conf_soc_off_summer:
@@ -212,18 +220,29 @@ input_number:
     initial: 8
     unit_of_measurement: "%"
 
+  # FIX 11: the bypass limit is seasonal now. Between the cutoff and this limit the device only
+  # passes PV through (no battery discharge). In winter it equals the cutoff (12), so there is no
+  # such zone and the battery is usable down to the cutoff; in summer it stays 8-20.
   zendure_conf_soc_bypass:
-    name: "SoC Limit: Bypass Mode"
+    name: "SoC Limit: Bypass Mode (Summer)"
     icon: mdi:battery-heart-variant
     min: 0
     max: 90
     initial: 20
     unit_of_measurement: "%"
 
+  zendure_conf_soc_bypass_winter:
+    name: "SoC Limit: Bypass Mode (Winter)"
+    icon: mdi:battery-heart-variant
+    min: 0
+    max: 90
+    initial: 18
+    unit_of_measurement: "%"
+
   zendure_conf_soc_emerg_start:
     name: "SoC Limit: Start Emergency Charge"
     min: 0
-    max: 20
+    max: 18
     initial: 6
     unit_of_measurement: "%"
 
@@ -231,10 +250,23 @@ input_number:
     name: "SoC Limit: Stop Emergency Charge"
     min: 5
     max: 50
-    initial: 15
+    initial: 16
     unit_of_measurement: "%"
 
   # --- LOGIC OPTIONS ---
+  # FIX 10: correction factor for the solar forecast (both devices). The forecast of tomorrow is
+  # multiplied by this value before it is compared with the threshold of the emergency charge.
+  # 100 = forecast as is, 80 = assume that only 80 % of the forecast will arrive.
+  zendure_conf_forecast_factor:
+    name: "Weather: Forecast Correction Factor"
+    icon: mdi:weather-sunny-alert
+    min: 20
+    max: 150
+    step: 5
+    initial: 80
+    unit_of_measurement: "%"
+    mode: box
+
   zendure_conf_forecast_thresh:
     name: "Weather: kWh Tomorrow for Charge Stop"
     icon: mdi:weather-sunny
@@ -530,29 +562,50 @@ automation:
         entity_id:
           - input_boolean.zendure_emergency_charge
           - input_boolean.zendure_calibration_mode
+      # FIX 9: heartbeat. The charge command used to be sent exactly once, when the switch
+      # changed. If the device was unreachable at that moment, or HA / the device restarted
+      # later (smartMode=1 keeps values in RAM), it stayed idle while "emergency charge"
+      # still showed on. Now the command is re-sent every 5 minutes as long as the device does
+      # not report the expected charge settings. The stop command is still only sent when the
+      # switch changes (so the heartbeat never overwrites the coordinator's allocation).
+      - platform: time_pattern
+        minutes: "/5"
+      - platform: homeassistant
+        event: start
     condition:
       # Safety: SN must exist
       - condition: template
         value_template: "{{ state_attr('sensor.solarflow_status_raw','sn') is not none }}"
     action:
+      - variables:
+          by_switch: "{{ trigger.platform == 'state' }}"
+          want: "{{ states('input_number.zendure_conf_emergency_watt') | int(0) }}"
+          charge_set: >-
+            {% set p = state_attr('sensor.solarflow_status_raw', 'properties') %}
+            {{ p is mapping
+               and (p.get('acMode', 0) | int(0)) == 1
+               and (p.get('inputLimit', -1) | int(-1)) == want | int(0)
+               and (p.get('outputLimit', -1) | int(-1)) == 0 }}
       - choose:
-          # CASE 1: START CHARGING
+          # CASE 1: START / KEEP CHARGING (on switch change, or when the device lacks the settings)
           - conditions: >
-              {{ is_state('input_boolean.zendure_emergency_charge','on')
-                 or is_state('input_boolean.zendure_calibration_mode','on') }}
+              {{ (is_state('input_boolean.zendure_emergency_charge','on')
+                  or is_state('input_boolean.zendure_calibration_mode','on'))
+                 and (by_switch or not charge_set) }}
             sequence:
               - service: rest_command.zendure_force_charge
                 data:
-                  limit: "{{ states('input_number.zendure_conf_emergency_watt')|int }}"
+                  limit: "{{ want }}"
               - service: input_number.set_value
                 target:
                   entity_id: input_number.zendure_last_sent_limit
                 data:
-                  value: -2 
+                  value: -2
 
-          # CASE 2: STOP CHARGING (Back to 0W)
+          # CASE 2: STOP CHARGING (back to 0 W) - only when the switch changed
           - conditions: >
-              {{ is_state('input_boolean.zendure_emergency_charge','off')
+              {{ by_switch
+                 and is_state('input_boolean.zendure_emergency_charge','off')
                  and is_state('input_boolean.zendure_calibration_mode','off') }}
             sequence:
               - service: rest_command.zendure_set_output
@@ -609,7 +662,8 @@ automation:
           # FIX 1: fallback 20 instead of 0. With 'unavailable' the old `| int`
           # returned 0, so "battery <= soc_off" was never true.
           soc_off: "{{ states('input_number.zendure_conf_soc_off_' ~ season) | int(20) }}"
-          soc_bypass: "{{ states('input_number.zendure_conf_soc_bypass') | int }}"
+          # FIX 11: seasonal bypass limit
+          soc_bypass: "{{ states('input_number.zendure_conf_soc_bypass' ~ ('_winter' if season == 'winter' else '')) | int(20) }}"
           
           # --- SENSORS & MEMORY ---
           shelly_ok: "{{ states('sensor.power_import') | is_number and states('sensor.power_export') | is_number }}"
@@ -635,7 +689,16 @@ automation:
                {{ raw_last_sent }}
              {% endif %}
 
-          temp_device: "{{ states('sensor.solarflow_device_temp') | float(20) }}"
+          # FIX 8: coldest valid temperature of device (hyperTmp) and packs. The old line read
+          # sensor.solarflow_device_temp, which does not exist here (the sensor is called
+          # ...enclosure_temp), so it always fell back to 20 and the winter protection never fired.
+          temp_device: >-
+            {% set p = state_attr('sensor.solarflow_status_raw', 'properties') %}
+            {% set raw = (p.get('hyperTmp', 2931) | float(2931)) if p is mapping else 2931 %}
+            {% set hub = ((raw - 2731) / 10) if raw > 2000 else 20 %}
+            {% set packs = [states('sensor.solarflow_pack_1_temperature'), states('sensor.solarflow_pack_2_temperature')]
+                           | select('is_number') | map('float') | select('gt', -40) | select('lt', 80) | list %}
+            {{ ([hub] + packs) | min }}
           battery: "{{ states('sensor.solarflow_battery_level') | float(0) }}"
           pv_power: "{{ states('sensor.solarflow_solar_input') | float(0) }}"
 
@@ -818,7 +881,8 @@ automation:
           # flaps on and off on every Logic Manager tick (helper bounds allow stop <= start).
           stop_raw: "{{ states('input_number.zendure_conf_soc_emerg_stop')|int }}"
           stop_lim: "{{ [stop_raw, start_lim + 1] | max }}"
-          forecast: "{{ states('sensor.energy_production_tomorrow_2')|float(0) }}"
+          # FIX 10: forecast corrected by the factor helper (100 % if the helper is missing)
+          forecast: "{{ states('sensor.energy_production_tomorrow_2') | float(0) * (states('input_number.zendure_conf_forecast_factor') | float(100) / 100) }}"
           thresh: "{{ states('input_number.zendure_conf_forecast_thresh')|float }}"
       
       - choose:
@@ -892,16 +956,16 @@ automation:
     #               title: "Zendure Calibration"
     #               message: "Complete (target SoC {{ socset | int }}% reached)."
 
-      # Check Calibration (start only during the low-tariff window; once started it runs until the battery is full).
-      # Calibration only starts after 20:00, i.e. inside the low-tariff window.
-      # Charge speed: if time could get tight, increase zendure_conf_emergency_watt (“AC Charge Speed”).
-      # This also applies to emergency charging.
+      # Check Calibration (starts only at the low tariff, then runs until full) / with Claude
+      # calibration only starts after 21:00 at the low tariff.
+      # Charge speed: if time could get tight, increase zendure_conf_emergency_watt (“AC Charge Speed”). 
+      # This also applies to the emergency charge.
       - variables:
           days_threshold: "{{ states('input_number.zendure_conf_calib_days') | int }}"
           last_run: "{{ states('input_datetime.zendure_last_full_charge') }}"
           # Low-tariff window, only relevant for the START (full hours, 24h):
-          win_start: 20
-          win_end: 7
+          win_start: 21
+          win_end: 6
           in_window: >-
             {% set h = now().hour %}
             {% if win_start > win_end %}
@@ -918,7 +982,7 @@ automation:
             {% else %} 999 {% endif %}
 
       - choose:
-          # START: only inside the low-tariff window
+          # START: only within the low-tariff window
           - conditions:
               - condition: template
                 value_template: "{{ days_diff | float >= days_threshold }}"
@@ -936,7 +1000,7 @@ automation:
                   title: "Zendure Cell Maintenance"
                   message: "Starting calibration ({{ days_diff | int }} days without full charge)."
 
-          # ENDE: Ziel-SoC erreicht, jederzeit
+          # END: target SoC reached, at any time
           - conditions:
               - condition: template
                 value_template: "{{ bat >= socset - 1 }}"

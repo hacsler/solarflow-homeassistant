@@ -1,0 +1,102 @@
+################################################################################
+#          ZENDURE LAMP - KEEP THE LAMP OFF AFTER HOME ASSISTANT START         #
+################################################################################
+#
+# PROBLEM:
+# The property lampSwitch is not documented by Zendure (the official property list does not
+# contain it, the OpenAPI file only says "integer"), so the meaning of 0 and 1 is unknown.
+# On this installation lampSwitch reports 1 while the lamp on the device is not lit.
+#
+# WHAT THIS PACKAGE DOES (optional, read the setup first):
+# One minute after Home Assistant starts, and whenever a device comes back online, it checks
+# lampSwitch of both devices. If the value differs from the value that means "off", it writes the
+# "off" value (local API, same command path as the charge command). Two passes, 1 and 3 minutes
+# after the trigger, so that writes of another integration right after the start are corrected too.
+#
+# SETUP:
+# 1. Find out which value means OFF (the helper below defaults to 1, derived from your report
+#    "value 1, lamp not lit" - please confirm with the test):
+#      Developer tools -> Actions -> rest_command.zendure_set_property_for with
+#        ip: <IP of device 1>
+#        sn: <serial number of device 1>
+#        payload: '{"properties": {"lampSwitch": 0}, "sn": "<serial number>"}'
+#    Wait about 15 seconds and watch the lamp on the device, then repeat with 1.
+#    The value at which the lamp is dark is the OFF value.
+# 2. Set "Zendure: Lamp Value for OFF" accordingly.
+# 3. Switch on "Zendure: Keep Lamp Off after Start". Until then this package does nothing.
+#
+# NOTE: The lamp may only light up in certain operating states (for example while charging or
+# discharging). Test with a device that is not in standby.
+#
+################################################################################
+
+input_number:
+  # `initial` defines the default (1 = value that means OFF, see setup). It is applied on every restart;
+  # change it here if the test shows that 0 means OFF.
+  zendure_conf_lamp_off_value:
+    name: "Zendure: Lamp Value for OFF"
+    icon: mdi:lightbulb-off-outline
+    min: 0
+    max: 1
+    step: 1
+    initial: 1
+    mode: box
+
+input_boolean:
+  # No `initial:` so the switch stays off until you enable it, and keeps your choice across restarts.
+  zendure_lamp_enforce:
+    name: "Zendure: Keep Lamp Off after Start"
+    icon: mdi:lightbulb-off
+
+automation:
+  - alias: "Zendure: Lamp Off after Start"
+    id: "zendure_lamp_off_after_start"
+    mode: restart
+    trigger:
+      - platform: homeassistant
+        event: start
+      # a device that was unreachable is back
+      - platform: state
+        entity_id:
+          - sensor.solarflow_status_raw
+          - sensor.solarflow_2_status_raw
+        from:
+          - "unavailable"
+          - "unknown"
+        to: "OK"
+    condition:
+      - condition: state
+        entity_id: input_boolean.zendure_lamp_enforce
+        state: "on"
+    action:
+      - repeat:
+          count: 2
+          sequence:
+            # wait, so that writes of other integrations right after the start are corrected as well
+            - delay:
+                seconds: "{{ 60 if repeat.index == 1 else 120 }}"
+            - repeat:
+                for_each:
+                  - ip: "{{ states('input_text.zendure_device_ip') }}"
+                    sn: "{{ state_attr('sensor.solarflow_status_raw', 'sn') }}"
+                    status: "sensor.solarflow_status_raw"
+                  - ip: "{{ states('input_text.zendure_device_2_ip') }}"
+                    sn: "{{ state_attr('sensor.solarflow_2_status_raw', 'sn') }}"
+                    status: "sensor.solarflow_2_status_raw"
+                sequence:
+                  - if:
+                      - condition: template
+                        value_template: >-
+                          {% set p = state_attr(repeat.item.status, 'properties') %}
+                          {% set off = states('input_number.zendure_conf_lamp_off_value') | int(1) %}
+                          {{ repeat.item.sn not in [none, 'None', ''] and p is mapping
+                             and (p.get('lampSwitch', -1) | int(-1)) in [0, 1]
+                             and (p.get('lampSwitch', -1) | int(-1)) != off }}
+                    then:
+                      - service: rest_command.zendure_set_property_for
+                        data:
+                          ip: "{{ repeat.item.ip }}"
+                          sn: "{{ repeat.item.sn }}"
+                          payload: >-
+                            {% set off = states('input_number.zendure_conf_lamp_off_value') | int(1) %}
+                            {"properties": {"lampSwitch": {{ off }} }, "sn": "{{ repeat.item.sn }}"}

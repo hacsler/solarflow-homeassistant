@@ -683,7 +683,7 @@ template:
 
       # ════════════════════════════════════════════════════════════════════
       # BATTERY PACK 1 SENSORS (packData[0])
-      # SN: COXXXXXXXXXXXXX
+      # SN: CO4EHNCDN331097
       # ════════════════════════════════════════════════════════════════════
       # Requires "packData" in json_attributes of the REST sensor.
 
@@ -844,7 +844,7 @@ template:
 
       # ════════════════════════════════════════════════════════════════════
       # BATTERY PACK 2 SENSORS (packData[1])
-      # SN: COYYYYYYYYYYYYY
+      # SN: CO4ESNFRN360036
       # ════════════════════════════════════════════════════════════════════
 
       - name: "SolarFlow 2 Pack 2 SoC"

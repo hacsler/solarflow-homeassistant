@@ -1,0 +1,78 @@
+{# ===== Zendure: all settings with current value =====
+   In Home Assistant: Developer tools -> Template, paste the complete content.
+   Display only, changes nothing. If a helper is missing, it shows "<-- missing/unavailable". -#}
+{% macro z(e, t) -%}
+{% set v = states(e) -%}
+{% set u = state_attr(e, 'unit_of_measurement') or '' -%}
+{{ '%-30s' | format(t) }}{{ ('%g' | format(v | float)) if v | is_number else ('(empty)' if v == '' else v) }}{{ ' ' ~ u if (u and v | is_number) else '' }}{{ '   <-- missing/unavailable' if v in ['unknown', 'unavailable'] else '' }}
+{% endmacro -%}
+{% set season = 'summer' if states('sensor.zendure_active_season') == 'summer' else 'winter' -%}
+{% set ff = states('input_number.zendure_conf_forecast_factor') | float(100) / 100 -%}
+{% set capf = states('input_number.zendure_2_conf_capacity_factor') | float(0.5) -%}
+{% set pvf = states('input_number.zendure_2_conf_pv_factor') | float(0.25) -%}
+{% set thr = states('input_number.zendure_conf_forecast_thresh') | float(2.5) -%}
+== GENERAL ==
+{{ z('sensor.zendure_active_season', 'Active season') -}}
+{{ z('input_datetime.zendure_conf_winter_start', 'Winter start') -}}
+{{ z('input_datetime.zendure_conf_summer_start', 'Summer start') -}}
+{{ z('input_boolean.zendure_auto_mode', 'Auto mode device 1') -}}
+{{ z('input_boolean.zendure_coordinator_enabled', 'Coordinator active') -}}
+{{ z('input_boolean.zendure_dry_run', 'Dry run (test only)') -}}
+{{ z('input_select.zendure_allocation_strategy', 'Allocation strategy') -}}
+{{ z('input_boolean.zendure_enabled', 'Device 1 enabled') -}}
+{{ z('input_boolean.zendure_2_enabled', 'Device 2 enabled') -}}
+{{ z('input_text.zendure_device_ip', 'IP device 1') -}}
+{{ z('input_text.zendure_device_2_ip', 'IP device 2') }}
+== CONTROL (both devices) ==
+{{ z('input_number.zendure_conf_max_output', 'Max. output per device') -}}
+{{ z('input_number.zendure_conf_hysteresis', 'Control hysteresis') -}}
+{{ z('input_number.zendure_conf_grid_bias_winter', 'Grid buffer winter') -}}
+{{ z('input_number.zendure_conf_grid_bias_summer', 'Grid buffer summer') -}}
+{{ z('input_number.zendure_conf_failsafe_watt', 'Failsafe base load (Shelly)') -}}
+{{ z('input_number.zendure_conf_saturation_watt_winter', 'Min. output full (winter)') -}}
+{{ z('input_number.zendure_conf_saturation_watt_summer', 'Min. output full (summer)') }}
+== BATTERY LIMITS ==
+{{ z('input_number.zendure_conf_soc_off_winter', 'Cutoff winter') -}}
+{{ z('input_number.zendure_conf_soc_off_summer', 'Cutoff summer') -}}
+{{ z('input_number.zendure_conf_soc_bypass_winter', 'Bypass PV only (winter)') -}}
+{{ z('input_number.zendure_conf_soc_bypass', 'Bypass PV only (summer)') -}}
+{{ z('input_number.zendure_conf_soc_emerg_start', 'Emergency charge start below') -}}
+{{ z('input_number.zendure_conf_soc_emerg_stop', 'Emergency charge stop above') -}}
+{{ z('input_number.zendure_conf_emergency_watt', 'AC charge power emergency') -}}
+{{ z('input_number.zendure_conf_calib_days', 'Calibration after days') }}
+== FORECAST ==
+{{ z('input_number.zendure_conf_forecast_factor', 'Forecast factor') -}}
+{{ z('input_number.zendure_conf_forecast_thresh', 'Forecast threshold emergency') -}}
+{{ z('input_text.zmon_fc_suffix_1', 'Forecast suffix device 1') -}}
+{{ z('input_text.zmon_fc_suffix_2', 'Forecast suffix device 2') }}
+== DEVICE 1 STATUS ==
+{{ z('input_boolean.zendure_emergency_charge', 'Emergency charge D1 active') -}}
+{{ z('input_boolean.zendure_calibration_mode', 'Calibration D1 running') -}}
+{{ z('input_datetime.zendure_last_full_charge', 'Last full charge D1') -}}
+{{ z('input_number.zendure_last_sent_limit', 'Last sent D1') }}
+== DEVICE 2 SETTINGS ==
+{{ z('input_number.zendure_2_conf_capacity_factor', 'Capacity factor (D1 = 1)') -}}
+{{ z('input_number.zendure_2_conf_pv_factor', 'PV factor (D1 = 1)') -}}
+{{ z('input_number.zendure_2_conf_discharge_release_soc', 'Release from (0=off)') -}}
+{{ z('input_number.zendure_2_conf_discharge_hysteresis', 'Re-lock hysteresis charge-first') -}}
+{{ z('input_number.zendure_2_conf_assist_deficit_w', 'Assist from deficit (0=off)') -}}
+{{ z('input_number.zendure_2_conf_assist_min_soc', 'Assist minimum charge level') -}}
+{{ z('input_boolean.zendure_2_discharge_released', 'Discharge released') }}
+== DEVICE 2 STATUS ==
+{{ z('input_boolean.zendure_2_emergency_charge', 'Emergency charge D2 active') -}}
+{{ z('input_boolean.zendure_2_calibration_mode', 'Calibration D2 running') -}}
+{{ z('input_datetime.zendure_2_last_full_charge', 'Last full charge D2') -}}
+{{ z('input_number.zendure_2_last_sent_limit', 'Last sent D2') -}}
+{{ z('binary_sensor.zendure_2_assist_request', 'Assist active (D2)') -}}
+{{ z('sensor.zendure_assist_deficit', 'Deficit other devices') }}
+== EFFECTIVE VALUES (calculated) ==
+{{ '%-30s' | format('Active cutoff') }}{{ states('input_number.zendure_conf_soc_off_' ~ season) | float(20) | round(0) | int }} %
+{{ '%-30s' | format('Active bypass limit') }}{{ states('input_number.zendure_conf_soc_bypass' ~ ('_winter' if season == 'winter' else '')) | float(20) | round(0) | int }} %
+{{ '%-30s' | format('Active grid buffer') }}{{ states('input_number.zendure_conf_grid_bias_' ~ season) | float(0) | round(0) | int }} W
+{{ '%-30s' | format('D2 failsafe effective') }}{{ (states('input_number.zendure_conf_failsafe_watt') | float(130) * capf) | round(0) | int }} W
+{{ '%-30s' | format('D2 emergency power effective') }}{{ (states('input_number.zendure_conf_emergency_watt') | float(500) * capf) | round(0) | int }} W
+{{ '%-30s' | format('D2 min. output full effective') }}{{ (states('input_number.zendure_conf_saturation_watt_' ~ season) | float(250) * pvf) | round(0) | int }} W
+{{ '%-30s' | format('D1 forecast trigger (raw)') }}{{ (thr / ff) | round(2) }} kWh
+{{ '%-30s' | format('D2 forecast trigger (raw)') }}{{ (thr * pvf / ff) | round(2) }} kWh
+{% set rel = states('input_number.zendure_2_conf_discharge_release_soc') | float(0) -%}
+{{ '%-30s' | format('D2 re-lock below') }}{{ 'off (release 0)' if rel <= 0 else ((rel - states('input_number.zendure_2_conf_discharge_hysteresis') | float(5)) | round(0) | int ~ ' %') }}
